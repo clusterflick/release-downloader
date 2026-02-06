@@ -33443,8 +33443,11 @@ class ReleaseDownloader {
         }
         return downloads;
     }
+    /** Max concurrent download requests to avoid GitHub rate limiting (403) */
+    static DOWNLOAD_BATCH_SIZE = 50;
     /**
-     * Downloads the specified assets from a given URL
+     * Downloads the specified assets from a given URL in batches to avoid
+     * triggering GitHub rate limits when many assets are downloaded at once.
      * @param dData The download metadata
      * @param out Target directory
      */
@@ -33453,11 +33456,13 @@ class ReleaseDownloader {
         if (!fs.existsSync(outFileDir)) {
             io.mkdirP(outFileDir);
         }
-        const downloads = [];
-        for (const asset of dData) {
-            downloads.push(this.downloadFile(asset, out));
+        const batchSize = ReleaseDownloader.DOWNLOAD_BATCH_SIZE;
+        const result = [];
+        for (let i = 0; i < dData.length; i += batchSize) {
+            const batch = dData.slice(i, i + batchSize);
+            const batchResults = await Promise.all(batch.map(async (asset) => this.downloadFile(asset, out)));
+            result.push(...batchResults);
         }
-        const result = await Promise.all(downloads);
         return result;
     }
     async downloadFile(asset, outputPath) {
