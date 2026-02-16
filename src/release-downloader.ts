@@ -277,6 +277,9 @@ export class ReleaseDownloader {
     return result
   }
 
+  private static readonly RETRY_DELAY_MS = 30_000
+  private static readonly MAX_RETRIES = 3
+
   private async downloadFile(
     asset: DownloadMetaData,
     outputPath: string
@@ -289,17 +292,37 @@ export class ReleaseDownloader {
       headers['Accept'] = '*/*'
     }
 
-    core.info(`Downloading file: ${asset.fileName} to: ${outputPath}`)
-    const response = await this.httpClient.get(asset.url, headers)
-
-    if (response.message.statusCode === 200) {
-      return this.saveFile(outputPath, asset.fileName, response)
-    } else {
-      const err: Error = new Error(
-        `Unexpected response: ${response.message.statusCode}`
+    for (let attempt = 1; attempt <= ReleaseDownloader.MAX_RETRIES; attempt++) {
+      core.info(
+        `Downloading file: ${asset.fileName} to: ${outputPath} (attempt ${attempt}/${ReleaseDownloader.MAX_RETRIES})`
       )
-      throw err
+      const response = await this.httpClient.get(asset.url, headers)
+
+      if (response.message.statusCode === 200) {
+        return this.saveFile(outputPath, asset.fileName, response)
+      }
+
+      if (
+        response.message.statusCode === 502 &&
+        attempt < ReleaseDownloader.MAX_RETRIES
+      ) {
+        core.warning(
+          `Received 502 downloading ${asset.fileName}, retrying in ${ReleaseDownloader.RETRY_DELAY_MS / 1000}s...`
+        )
+        await this.delay(ReleaseDownloader.RETRY_DELAY_MS)
+        continue
+      }
+
+      throw new Error(`Unexpected response: ${response.message.statusCode}`)
     }
+
+    throw new Error(
+      `Failed to download ${asset.fileName} after ${ReleaseDownloader.MAX_RETRIES} attempts`
+    )
+  }
+
+  private async delay(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms))
   }
 
   private async saveFile(
