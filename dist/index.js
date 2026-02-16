@@ -33465,6 +33465,8 @@ class ReleaseDownloader {
         }
         return result;
     }
+    static RETRY_DELAY_MS = 30_000;
+    static MAX_RETRIES = 3;
     async downloadFile(asset, outputPath) {
         const headers = {
             Accept: 'application/octet-stream'
@@ -33472,15 +33474,24 @@ class ReleaseDownloader {
         if (asset.isTarBallOrZipBall) {
             headers['Accept'] = '*/*';
         }
-        core.info(`Downloading file: ${asset.fileName} to: ${outputPath}`);
-        const response = await this.httpClient.get(asset.url, headers);
-        if (response.message.statusCode === 200) {
-            return this.saveFile(outputPath, asset.fileName, response);
+        for (let attempt = 1; attempt <= ReleaseDownloader.MAX_RETRIES; attempt++) {
+            core.info(`Downloading file: ${asset.fileName} to: ${outputPath} (attempt ${attempt}/${ReleaseDownloader.MAX_RETRIES})`);
+            const response = await this.httpClient.get(asset.url, headers);
+            if (response.message.statusCode === 200) {
+                return this.saveFile(outputPath, asset.fileName, response);
+            }
+            if (response.message.statusCode === 502 &&
+                attempt < ReleaseDownloader.MAX_RETRIES) {
+                core.warning(`Received 502 downloading ${asset.fileName}, retrying in ${ReleaseDownloader.RETRY_DELAY_MS / 1000}s...`);
+                await this.delay(ReleaseDownloader.RETRY_DELAY_MS);
+                continue;
+            }
+            throw new Error(`Unexpected response: ${response.message.statusCode}`);
         }
-        else {
-            const err = new Error(`Unexpected response: ${response.message.statusCode}`);
-            throw err;
-        }
+        throw new Error(`Failed to download ${asset.fileName} after ${ReleaseDownloader.MAX_RETRIES} attempts`);
+    }
+    async delay(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
     }
     async saveFile(outputPath, fileName, httpClientResponse) {
         const outFilePath = path.resolve(outputPath, fileName);
