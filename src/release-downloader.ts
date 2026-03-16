@@ -245,7 +245,7 @@ export class ReleaseDownloader {
   }
 
   /** Max concurrent download requests to avoid GitHub rate limiting (403) */
-  private static readonly DOWNLOAD_BATCH_SIZE = 50
+  private static readonly DOWNLOAD_BATCH_SIZE = 30
 
   /**
    * Downloads the specified assets from a given URL in batches to avoid
@@ -279,6 +279,21 @@ export class ReleaseDownloader {
 
   private static readonly RETRY_DELAY_MS = 30_000
   private static readonly MAX_RETRIES = 3
+  private static readonly RETRYABLE_STATUS_CODES = new Set([
+    408, 429, 500, 502, 503, 504
+  ])
+  private static readonly RETRYABLE_ERROR_CODES = new Set([
+    'ECONNRESET',
+    'ECONNABORTED',
+    'ETIMEDOUT',
+    'EPIPE',
+    'ENOTFOUND',
+    'EAI_AGAIN',
+    'UND_ERR_SOCKET',
+    'UND_ERR_CONNECT_TIMEOUT',
+    'UND_ERR_HEADERS_TIMEOUT',
+    'UND_ERR_BODY_TIMEOUT'
+  ])
 
   private async downloadFile(
     asset: DownloadMetaData,
@@ -296,18 +311,35 @@ export class ReleaseDownloader {
       core.info(
         `Downloading file: ${asset.fileName} to: ${outputPath} (attempt ${attempt}/${ReleaseDownloader.MAX_RETRIES})`
       )
-      const response = await this.httpClient.get(asset.url, headers)
+
+      let response: IHttpClientResponse
+      try {
+        response = await this.httpClient.get(asset.url, headers)
+      } catch (error) {
+        if (
+          this.isRetryableNetworkError(error) &&
+          attempt < ReleaseDownloader.MAX_RETRIES
+        ) {
+          core.warning(
+            `Received transient network error downloading ${asset.fileName}, retrying in ${ReleaseDownloader.RETRY_DELAY_MS / 1000}s...`
+          )
+          await this.delay(ReleaseDownloader.RETRY_DELAY_MS)
+          continue
+        }
+
+        throw error
+      }
 
       if (response.message.statusCode === 200) {
         return this.saveFile(outputPath, asset.fileName, response)
       }
 
       if (
-        response.message.statusCode === 502 &&
+        this.isRetryableStatusCode(response.message.statusCode) &&
         attempt < ReleaseDownloader.MAX_RETRIES
       ) {
         core.warning(
-          `Received 502 downloading ${asset.fileName}, retrying in ${ReleaseDownloader.RETRY_DELAY_MS / 1000}s...`
+          `Received ${response.message.statusCode} downloading ${asset.fileName}, retrying in ${ReleaseDownloader.RETRY_DELAY_MS / 1000}s...`
         )
         await this.delay(ReleaseDownloader.RETRY_DELAY_MS)
         continue
@@ -323,6 +355,38 @@ export class ReleaseDownloader {
 
   private async delay(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms))
+  }
+
+  private isRetryableStatusCode(statusCode?: number): boolean {
+    if (statusCode === undefined) {
+      return false
+    }
+
+    return ReleaseDownloader.RETRYABLE_STATUS_CODES.has(statusCode)
+  }
+
+  private isRetryableNetworkError(error: unknown): boolean {
+    if (typeof error !== 'object' || error === null) {
+      return false
+    }
+
+    const errorCode = (error as { code?: string }).code
+    if (
+      errorCode !== undefined &&
+      ReleaseDownloader.RETRYABLE_ERROR_CODES.has(errorCode)
+    ) {
+      return true
+    }
+
+    const message = (
+      (error as { message?: string }).message ?? ''
+    ).toLowerCase()
+    return (
+      message.includes('socket hang up') ||
+      message.includes('timed out') ||
+      message.includes('timeout') ||
+      message.includes('network error')
+    )
   }
 
   private async saveFile(

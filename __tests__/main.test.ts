@@ -426,3 +426,48 @@ test('Download from a release containing only tarBall & zipBall', async () => {
   const result = await downloader.download(downloadSettings)
   expect(result.length).toBe(2)
 })
+
+test('Retry asset download on socket hang up', async () => {
+  nock.cleanAll()
+
+  nock('https://api.github.com')
+    .get('/repos/robinraju/probable-potato/releases/latest')
+    .reply(200, readFromFile('1-release-latest.json'))
+
+  nock('https://api.github.com', {
+    reqheaders: { accept: 'application/octet-stream' }
+  })
+    .get('/repos/robinraju/probable-potato/releases/assets/66946546')
+    .replyWithError({
+      message: 'socket hang up',
+      code: 'ECONNRESET'
+    })
+    .get('/repos/robinraju/probable-potato/releases/assets/66946546')
+    .replyWithFile(200, `${__dirname}/resource/assets/test-1.txt`)
+
+  const delaySpy = jest
+    .spyOn(
+      downloader as unknown as { delay: (ms: number) => Promise<void> },
+      'delay'
+    )
+    .mockResolvedValue(undefined)
+
+  const downloadSettings: IReleaseDownloadSettings = {
+    sourceRepoPath: 'robinraju/probable-potato',
+    isLatest: true,
+    preRelease: false,
+    tag: '',
+    id: '',
+    fileName: 'test-1.txt',
+    tarBall: false,
+    zipBall: false,
+    extractAssets: false,
+    outFilePath: outputFilePath
+  }
+
+  const result = await downloader.download(downloadSettings)
+  expect(result.length).toBe(1)
+  expect(delaySpy).toHaveBeenCalledTimes(1)
+
+  delaySpy.mockRestore()
+})
