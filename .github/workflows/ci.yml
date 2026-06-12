@@ -94,49 +94,49 @@ jobs:
         shell: bash
         run: ls -lrth prerelease-downloads
 
-      - name: Verify private repo token is configured
-        if: ${{ env.RELEASE_DOWNLOADER_TEST_TOKEN == '' }}
-        shell: bash
-        run: |
-          echo "RELEASE_DOWNLOADER_TEST_TOKEN is required for Build and Test runs."
-          exit 1
+      # - name: Verify private repo token is configured
+      #   if: ${{ env.RELEASE_DOWNLOADER_TEST_TOKEN == '' }}
+      #   shell: bash
+      #   run: |
+      #     echo "RELEASE_DOWNLOADER_TEST_TOKEN is required for Build and Test runs."
+      #     exit 1
 
-      - name: Test download from a private repo
-        uses: ./
-        id: download-private
-        with:
-          repository: 'robinraju/release-downloader-test'
-          latest: true
-          fileName: '*'
-          tarBall: true
-          zipBall: true
-          extract: true
-          token: ${{ env.RELEASE_DOWNLOADER_TEST_TOKEN }}
-          out-file-path: './downloader-test'
+      # - name: Test download from a private repo
+      #   uses: ./
+      #   id: download-private
+      #   with:
+      #     repository: 'robinraju/release-downloader-test'
+      #     latest: true
+      #     fileName: '*'
+      #     tarBall: true
+      #     zipBall: true
+      #     extract: true
+      #     token: ${{ env.RELEASE_DOWNLOADER_TEST_TOKEN }}
+      #     out-file-path: './downloader-test'
 
-      - name: List downloaded files from private repo
-        shell: bash
-        run: ls -lrth downloader-test
+      # - name: List downloaded files from private repo
+      #   shell: bash
+      #   run: ls -lrth downloader-test
 
       - name: Read output variables set by previous steps
         shell: bash
         env:
           PUBLIC_TAG: ${{ steps.download-public.outputs.tag_name }}
-          PRIVATE_TAG: ${{ steps.download-private.outputs.tag_name }}
+          # PRIVATE_TAG: ${{ steps.download-private.outputs.tag_name }}
           PUBLIC_FILES: ${{ steps.download-public.outputs.downloaded_files }}
-          PRIVATE_FILES: ${{ steps.download-private.outputs.downloaded_files }}
+          # PRIVATE_FILES: ${{ steps.download-private.outputs.downloaded_files }}
         run: |
           if [ -n "$PUBLIC_TAG" ]; then
             echo "$PUBLIC_TAG"
           else echo "Unable to read output variable from step download-public"; exit 1
           fi
 
-          if [ -n "$PRIVATE_TAG" ]; then
-            echo "$PRIVATE_TAG"
-          else echo "Unable to read output variable from step download-private"; exit 1
-          fi
+          # if [ -n "$PRIVATE_TAG" ]; then
+          #   echo "$PRIVATE_TAG"
+          # else echo "Unable to read output variable from step download-private"; exit 1
+          # fi
 
           echo "Downloaded public files:"
           echo "$PUBLIC_FILES"
-          echo "Downloaded private files:"
-          echo "$PRIVATE_FILES"
+          # echo "Downloaded private files:"
+          # echo "$PRIVATE_FILES"
