@@ -9,6 +9,9 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
 jobs:
   build:
     strategy:
@@ -22,6 +25,8 @@ jobs:
     steps:
       - name: Checkout Repo
         uses: actions/checkout@v6
+        with:
+          persist-credentials: false
 
       - name: Setup node and cache dependencies
         uses: actions/setup-node@v6
@@ -97,16 +102,20 @@ jobs:
 
       - name: Read output variable set by previous steps
         shell: bash
+        env:
+          PUBLIC_TAG: ${{ steps.download-public.outputs.tag_name }}
+          PRIVATE_TAG: ${{ steps.download-private.outputs.tag_name }}
+          PUBLIC_FILES: ${{ steps.download-public.outputs.downloaded_files }}
         run: |
-          if [ -n ${{steps.download-public.outputs.tag_name}} ]; then
-            echo ${{steps.download-public.outputs.tag_name}}
+          if [ -n "$PUBLIC_TAG" ]; then
+            echo "$PUBLIC_TAG"
           else echo "Unable to read output variable from step download-public"; exit 1
           fi
 
-          if [ -n ${{steps.download-private.outputs.tag_name}} ]; then
-            echo ${{steps.download-private.outputs.tag_name}}
+          if [ -n "$PRIVATE_TAG" ]; then
+            echo "$PRIVATE_TAG"
           else echo "Unable to read output variable from step download-private"; exit 1
           fi
 
           echo "Downloaded files:"
-          echo ${{steps.download-public.outputs.downloaded_files}}
+          echo "$PUBLIC_FILES"
