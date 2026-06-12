@@ -1,13 +1,17 @@
+import { jest } from '@jest/globals'
 import * as fs from 'fs'
 import * as path from 'path'
-import * as handlers from 'typed-rest-client/Handlers'
+import * as handlers from 'typed-rest-client/Handlers.js'
 import * as io from '@actions/io'
-import * as thc from 'typed-rest-client/HttpClient'
+import * as thc from 'typed-rest-client/HttpClient.js'
+import { fileURLToPath } from 'url'
 
-import { IReleaseDownloadSettings } from '../src/download-settings'
-import { ReleaseDownloader } from '../src/release-downloader'
+import { IReleaseDownloadSettings } from '../src/download-settings.js'
+import { ReleaseDownloader } from '../src/release-downloader.js'
 import nock from 'nock'
-import { extract } from '../src/unarchive'
+import { extract } from '../src/unarchive.js'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 let downloader: ReleaseDownloader
 let httpClent: thc.HttpClient
@@ -152,7 +156,8 @@ test('Download all files from public repo', async () => {
     tarBall: false,
     zipBall: false,
     extractAssets: false,
-    outFilePath: outputFilePath
+    outFilePath: outputFilePath,
+    extractPath: outputFilePath
   }
   const result = await downloader.download(downloadSettings)
   expect(result.length).toBe(7)
@@ -169,7 +174,8 @@ test('Download single file from public repo', async () => {
     tarBall: false,
     zipBall: false,
     extractAssets: false,
-    outFilePath: outputFilePath
+    outFilePath: outputFilePath,
+    extractPath: outputFilePath
   }
   const result = await downloader.download(downloadSettings)
   expect(result.length).toBe(1)
@@ -186,11 +192,12 @@ test('Fail loudly if given filename is not found in a release', async () => {
     tarBall: false,
     zipBall: false,
     extractAssets: false,
-    outFilePath: outputFilePath
+    outFilePath: outputFilePath,
+    extractPath: outputFilePath
   }
   const result = downloader.download(downloadSettings)
   await expect(result).rejects.toThrow(
-    'Asset with name missing-file.txt not found!'
+    "No asset matching 'missing-file.txt' found in release"
   )
 }, 10000)
 
@@ -205,11 +212,12 @@ test('Fail loudly if release is not identified', async () => {
     tarBall: false,
     zipBall: false,
     extractAssets: false,
-    outFilePath: outputFilePath
+    outFilePath: outputFilePath,
+    extractPath: outputFilePath
   }
   const result = downloader.download(downloadSettings)
   await expect(result).rejects.toThrow(
-    'Config error: Please input a valid tag or release ID, or specify `latest`'
+    'Please input a valid tag or release ID, or specify `latest`'
   )
 }, 10000)
 
@@ -224,7 +232,8 @@ test('Download files with wildcard from public repo', async () => {
     tarBall: false,
     zipBall: false,
     extractAssets: false,
-    outFilePath: outputFilePath
+    outFilePath: outputFilePath,
+    extractPath: outputFilePath
   }
   const result = await downloader.download(downloadSettings)
   expect(result.length).toBe(2)
@@ -241,7 +250,8 @@ test('Download single file with wildcard from public repo', async () => {
     tarBall: false,
     zipBall: false,
     extractAssets: false,
-    outFilePath: outputFilePath
+    outFilePath: outputFilePath,
+    extractPath: outputFilePath
   }
   const result = await downloader.download(downloadSettings)
   expect(result.length).toBe(1)
@@ -258,7 +268,8 @@ test('Download multiple pdf files with wildcard filename', async () => {
     tarBall: false,
     zipBall: false,
     extractAssets: false,
-    outFilePath: outputFilePath
+    outFilePath: outputFilePath,
+    extractPath: outputFilePath
   }
   const result = await downloader.download(downloadSettings)
   expect(result.length).toBe(2)
@@ -275,7 +286,8 @@ test('Download a csv file with wildcard filename', async () => {
     tarBall: false,
     zipBall: false,
     extractAssets: false,
-    outFilePath: outputFilePath
+    outFilePath: outputFilePath,
+    extractPath: outputFilePath
   }
   const result = await downloader.download(downloadSettings)
   expect(result.length).toBe(1)
@@ -294,7 +306,8 @@ test('Download file from Github Enterprise server', async () => {
     tarBall: false,
     zipBall: false,
     extractAssets: false,
-    outFilePath: outputFilePath
+    outFilePath: outputFilePath,
+    extractPath: outputFilePath
   }
   const result = await downloader.download(downloadSettings)
   expect(result.length).toBe(1)
@@ -311,7 +324,8 @@ test('Download file from release identified by ID', async () => {
     tarBall: false,
     zipBall: false,
     extractAssets: false,
-    outFilePath: outputFilePath
+    outFilePath: outputFilePath,
+    extractPath: outputFilePath
   }
   const result = await downloader.download(downloadSettings)
   expect(result.length).toBe(1)
@@ -328,7 +342,8 @@ test('Download all archive files from public repo', async () => {
     tarBall: false,
     zipBall: false,
     extractAssets: true,
-    outFilePath: outputFilePath
+    outFilePath: outputFilePath,
+    extractPath: outputFilePath
   }
   const result = await downloader.download(downloadSettings)
   if (downloadSettings.extractAssets) {
@@ -367,11 +382,12 @@ test('Fail when a release with no assets are obtained', async () => {
     tarBall: false,
     zipBall: false,
     extractAssets: false,
-    outFilePath: outputFilePath
+    outFilePath: outputFilePath,
+    extractPath: outputFilePath
   }
   const result = downloader.download(downloadSettings)
   await expect(result).rejects.toThrow(
-    'No assets found in release Foo app - v1.0.0'
+    "No asset matching 'installer.zip' found in release. Available assets: (no assets in release)"
   )
 }, 10000)
 
@@ -386,7 +402,8 @@ test('Download from latest prerelease', async () => {
     tarBall: false,
     zipBall: false,
     extractAssets: false,
-    outFilePath: outputFilePath
+    outFilePath: outputFilePath,
+    extractPath: outputFilePath
   }
   const result = await downloader.download(downloadSettings)
   expect(result.length).toBe(1)
@@ -403,10 +420,13 @@ test('Fail when a release with no prerelease is obtained', async () => {
     tarBall: false,
     zipBall: false,
     extractAssets: false,
-    outFilePath: outputFilePath
+    outFilePath: outputFilePath,
+    extractPath: outputFilePath
   }
   const result = downloader.download(downloadSettings)
-  await expect(result).rejects.toThrow('No prereleases found!')
+  await expect(result).rejects.toThrow(
+    "No prereleases found for repository 'foo/slick-pg'"
+  )
 }, 10000)
 
 test('Download from a release containing only tarBall & zipBall', async () => {
@@ -420,7 +440,8 @@ test('Download from a release containing only tarBall & zipBall', async () => {
     tarBall: true,
     zipBall: true,
     extractAssets: false,
-    outFilePath: outputFilePath
+    outFilePath: outputFilePath,
+    extractPath: outputFilePath
   }
 
   const result = await downloader.download(downloadSettings)
@@ -438,10 +459,7 @@ test('Retry asset download on socket hang up', async () => {
     reqheaders: { accept: 'application/octet-stream' }
   })
     .get('/repos/robinraju/probable-potato/releases/assets/66946546')
-    .replyWithError({
-      message: 'socket hang up',
-      code: 'ECONNRESET'
-    })
+    .replyWithError('socket hang up')
     .get('/repos/robinraju/probable-potato/releases/assets/66946546')
     .replyWithFile(200, `${__dirname}/resource/assets/test-1.txt`)
 
@@ -462,7 +480,8 @@ test('Retry asset download on socket hang up', async () => {
     tarBall: false,
     zipBall: false,
     extractAssets: false,
-    outFilePath: outputFilePath
+    outFilePath: outputFilePath,
+    extractPath: outputFilePath
   }
 
   const result = await downloader.download(downloadSettings)
@@ -470,4 +489,98 @@ test('Retry asset download on socket hang up', async () => {
   expect(delaySpy).toHaveBeenCalledTimes(1)
 
   delaySpy.mockRestore()
+})
+
+const retrySettings = (fileName: string): IReleaseDownloadSettings => ({
+  sourceRepoPath: 'robinraju/probable-potato',
+  isLatest: true,
+  preRelease: false,
+  tag: '',
+  id: '',
+  fileName,
+  tarBall: false,
+  zipBall: false,
+  extractAssets: false,
+  outFilePath: outputFilePath,
+  extractPath: outputFilePath
+})
+
+test('Retry asset download on retryable status code', async () => {
+  nock.cleanAll()
+
+  nock('https://api.github.com')
+    .get('/repos/robinraju/probable-potato/releases/latest')
+    .reply(200, readFromFile('1-release-latest.json'))
+
+  nock('https://api.github.com', {
+    reqheaders: { accept: 'application/octet-stream' }
+  })
+    .get('/repos/robinraju/probable-potato/releases/assets/66946546')
+    .reply(503, 'Service Unavailable')
+    .get('/repos/robinraju/probable-potato/releases/assets/66946546')
+    .replyWithFile(200, `${__dirname}/resource/assets/test-1.txt`)
+
+  const delaySpy = jest
+    .spyOn(
+      downloader as unknown as { delay: (ms: number) => Promise<void> },
+      'delay'
+    )
+    .mockResolvedValue(undefined)
+
+  const result = await downloader.download(retrySettings('test-1.txt'))
+  expect(result.length).toBe(1)
+  expect(delaySpy).toHaveBeenCalledTimes(1)
+
+  delaySpy.mockRestore()
+})
+
+test('Fail asset download after exhausting retries', async () => {
+  nock.cleanAll()
+
+  nock('https://api.github.com')
+    .get('/repos/robinraju/probable-potato/releases/latest')
+    .reply(200, readFromFile('1-release-latest.json'))
+
+  nock('https://api.github.com', {
+    reqheaders: { accept: 'application/octet-stream' }
+  })
+    .get('/repos/robinraju/probable-potato/releases/assets/66946546')
+    .times(3)
+    .reply(503, 'Service Unavailable')
+
+  const delaySpy = jest
+    .spyOn(
+      downloader as unknown as { delay: (ms: number) => Promise<void> },
+      'delay'
+    )
+    .mockResolvedValue(undefined)
+
+  await expect(
+    downloader.download(retrySettings('test-1.txt'))
+  ).rejects.toThrow("Download asset 'test-1.txt'")
+  expect(delaySpy).toHaveBeenCalledTimes(2)
+
+  delaySpy.mockRestore()
+})
+
+test('Retry helpers classify status codes and network errors', async () => {
+  const internal = downloader as unknown as {
+    isRetryableStatusCode: (code?: number) => boolean
+    isRetryableNetworkError: (err: unknown) => boolean
+    delay: (ms: number) => Promise<void>
+  }
+
+  expect(internal.isRetryableStatusCode(503)).toBe(true)
+  expect(internal.isRetryableStatusCode(200)).toBe(false)
+  expect(internal.isRetryableStatusCode(undefined)).toBe(false)
+
+  expect(internal.isRetryableNetworkError({ code: 'ECONNRESET' })).toBe(true)
+  expect(internal.isRetryableNetworkError({ message: 'socket hang up' })).toBe(
+    true
+  )
+  expect(internal.isRetryableNetworkError({ code: 'EACCES' })).toBe(false)
+  expect(internal.isRetryableNetworkError(null)).toBe(false)
+  expect(internal.isRetryableNetworkError('boom')).toBe(false)
+
+  await expect(internal.delay(1)).resolves.toBeUndefined()
 })
