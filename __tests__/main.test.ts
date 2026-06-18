@@ -571,6 +571,8 @@ test('Retry helpers classify status codes and network errors', async () => {
   }
 
   expect(internal.isRetryableStatusCode(503)).toBe(true)
+  expect(internal.isRetryableStatusCode(401)).toBe(true)
+  expect(internal.isRetryableStatusCode(403)).toBe(true)
   expect(internal.isRetryableStatusCode(200)).toBe(false)
   expect(internal.isRetryableStatusCode(undefined)).toBe(false)
 

@@ -284,7 +284,10 @@ export class ReleaseDownloader {
   private static readonly RETRY_DELAY_MS = 30_000
   private static readonly MAX_RETRIES = 3
   private static readonly RETRYABLE_STATUS_CODES = new Set([
-    408, 429, 500, 502, 503, 504
+    // 401/403 are included because GitHub redirects asset downloads to signed
+    // S3/blob URLs that intermittently return these mid-run even with a valid
+    // token; retrying recovers from those transient blips.
+    401, 403, 408, 429, 500, 502, 503, 504
   ])
   private static readonly RETRYABLE_ERROR_CODES = new Set([
     'ECONNRESET',
