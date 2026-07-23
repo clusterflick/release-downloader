@@ -38953,10 +38953,16 @@ class ReleaseDownloader {
         return downloads;
     }
     /** Max concurrent download requests to avoid GitHub rate limiting (403) */
-    static DOWNLOAD_BATCH_SIZE = 30;
+    static DOWNLOAD_CONCURRENCY = 30;
     /**
-     * Downloads the specified assets from a given URL in batches to avoid
-     * triggering GitHub rate limits when many assets are downloaded at once.
+     * Downloads the specified assets from a given URL, capping the number of
+     * requests in flight to avoid triggering GitHub rate limits when many assets
+     * are downloaded at once.
+     *
+     * Assets are pulled from a shared queue by a pool of workers rather than
+     * downloaded in fixed batches. Release assets vary in size by several orders
+     * of magnitude, so a batch barrier would leave most slots idle waiting on the
+     * largest file in each batch.
      * @param dData The download metadata
      * @param out Target directory
      */
@@ -38965,13 +38971,28 @@ class ReleaseDownloader {
         if (!I.existsSync(outFileDir)) {
             await mkdirP(outFileDir);
         }
-        const batchSize = ReleaseDownloader.DOWNLOAD_BATCH_SIZE;
-        const result = [];
-        for (let i = 0; i < dData.length; i += batchSize) {
-            const batch = dData.slice(i, i + batchSize);
-            const batchResults = await Promise.all(batch.map(async (asset) => this.downloadFile(asset, out)));
-            result.push(...batchResults);
-        }
+        // Results are written by index so the returned paths stay in the same
+        // order as the assets, regardless of the order downloads complete in.
+        const result = new Array(dData.length);
+        let next = 0;
+        let failed = false;
+        // Safe without locking: `next++` runs synchronously between awaits.
+        const worker = async () => {
+            while (next < dData.length && !failed) {
+                const index = next++;
+                try {
+                    result[index] = await this.downloadFile(dData[index], out);
+                }
+                catch (error) {
+                    // Stop the other workers picking up new assets; a failed download
+                    // fails the action, so continuing the queue is wasted work.
+                    failed = true;
+                    throw error;
+                }
+            }
+        };
+        const workerCount = Math.min(ReleaseDownloader.DOWNLOAD_CONCURRENCY, dData.length);
+        await Promise.all(Array.from({ length: workerCount }, async () => worker()));
         return result;
     }
     static RETRY_DELAY_MS = 30_000;
