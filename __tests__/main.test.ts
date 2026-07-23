@@ -586,3 +586,92 @@ test('Retry helpers classify status codes and network errors', async () => {
 
   await expect(internal.delay(1)).resolves.toBeUndefined()
 })
+
+type DownloadInternals = {
+  downloadFile: (asset: DownloadMetaData, out: string) => Promise<string>
+  downloadReleaseAssets: (
+    dData: DownloadMetaData[],
+    out: string
+  ) => Promise<string[]>
+}
+
+const fakeAssets = (count: number): DownloadMetaData[] =>
+  Array.from({ length: count }, (_unused, i) => ({
+    fileName: `asset-${i}.txt`,
+    url: `https://api.github.com/assets/${i}`,
+    isTarBallOrZipBall: false
+  }))
+
+test('Refill download slots without waiting on the slowest asset', async () => {
+  const internal = downloader as unknown as DownloadInternals
+  const assets = fakeAssets(40)
+
+  const started = new Set<string>()
+  let inFlight = 0
+  let maxInFlight = 0
+  let releaseSlowAsset: () => void = () => {}
+  const slowAsset = new Promise<void>(resolve => {
+    releaseSlowAsset = resolve
+  })
+
+  const downloadSpy = jest
+    .spyOn(internal, 'downloadFile')
+    .mockImplementation(async asset => {
+      started.add(asset.fileName)
+      inFlight++
+      maxInFlight = Math.max(maxInFlight, inFlight)
+      // Asset 0 holds its slot until released, standing in for one very large
+      // file queued alongside many small ones.
+      if (asset.fileName === 'asset-0.txt') {
+        await slowAsset
+      }
+      inFlight--
+      return asset.fileName
+    })
+
+  const pending = internal.downloadReleaseAssets(assets, outputFilePath)
+  await new Promise(resolve => setTimeout(resolve, 50))
+
+  // Downloading in fixed batches of 30 could not have reached asset 30 yet,
+  // because asset 0 is still holding the first batch open.
+  expect(started.has('asset-30.txt')).toBe(true)
+  expect(started.size).toBe(assets.length)
+  expect(maxInFlight).toBeLessThanOrEqual(30)
+
+  releaseSlowAsset()
+
+  // Results follow input order, not completion order.
+  await expect(pending).resolves.toEqual(assets.map(a => a.fileName))
+  expect(downloadSpy).toHaveBeenCalledTimes(assets.length)
+
+  downloadSpy.mockRestore()
+})
+
+test('Stop queuing further assets once a download fails', async () => {
+  const internal = downloader as unknown as DownloadInternals
+  const assets = fakeAssets(200)
+
+  const downloadSpy = jest
+    .spyOn(internal, 'downloadFile')
+    .mockImplementation(async asset => {
+      await new Promise(resolve => setTimeout(resolve, 1))
+      if (asset.fileName === 'asset-0.txt') {
+        throw new Error('boom')
+      }
+      return asset.fileName
+    })
+
+  await expect(
+    internal.downloadReleaseAssets(assets, outputFilePath)
+  ).rejects.toThrow('boom')
+
+  const callsAtFailure = downloadSpy.mock.calls.length
+  expect(callsAtFailure).toBeLessThan(assets.length)
+
+  // Workers stop pulling from the queue rather than quietly downloading the
+  // remaining assets in the background after the action has already failed.
+  await new Promise(resolve => setTimeout(resolve, 50))
+  expect(downloadSpy).toHaveBeenCalledTimes(callsAtFailure)
+
+  downloadSpy.mockRestore()
+})
