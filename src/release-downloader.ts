@@ -22,6 +22,37 @@ export class ReleaseDownloader {
 
   private apiRoot: string
 
+  /** Retry policy shared by the release metadata lookups and asset downloads */
+  private static readonly RETRY_DELAY_MS = 30_000
+  private static readonly MAX_RETRIES = 3
+
+  private static readonly RETRYABLE_ASSET_STATUS_CODES = new Set([
+    // 401/403 are included because GitHub redirects asset downloads to signed
+    // S3/blob URLs that intermittently return these mid-run even with a valid
+    // token; retrying recovers from those transient blips.
+    401, 403, 408, 429, 500, 502, 503, 504
+  ])
+
+  private static readonly RETRYABLE_API_STATUS_CODES = new Set([
+    // 403 covers secondary rate limits, which clear on their own. 401 is
+    // absent: an API call carries our own token with no signed-URL redirect in
+    // the way, so a 401 is a bad token and will fail identically every time.
+    403, 408, 429, 500, 502, 503, 504
+  ])
+
+  private static readonly RETRYABLE_ERROR_CODES = new Set([
+    'ECONNRESET',
+    'ECONNABORTED',
+    'ETIMEDOUT',
+    'EPIPE',
+    'ENOTFOUND',
+    'EAI_AGAIN',
+    'UND_ERR_SOCKET',
+    'UND_ERR_CONNECT_TIMEOUT',
+    'UND_ERR_HEADERS_TIMEOUT',
+    'UND_ERR_BODY_TIMEOUT'
+  ])
+
   constructor(httpClient: thc.HttpClient, githubApiUrl: string) {
     this.httpClient = httpClient
     this.apiRoot = githubApiUrl
@@ -72,6 +103,73 @@ export class ReleaseDownloader {
   }
 
   /**
+   * Performs a GitHub API request and returns its parsed JSON body, retrying
+   * transient network failures and server-side errors.
+   *
+   * These lookups read a few KB, but they gate every download that follows: a
+   * single dropped connection here failed the whole action, while the far
+   * larger asset downloads had been retried all along.
+   * @param url The API endpoint to read
+   * @param operation Human readable description, used in error messages
+   */
+  private async fetchReleaseMetadata<T>(
+    url: string,
+    operation: string
+  ): Promise<T> {
+    const headers: IHeaders = { Accept: 'application/vnd.github.v3+json' }
+
+    for (let attempt = 1; attempt <= ReleaseDownloader.MAX_RETRIES; attempt++) {
+      let response: IHttpClientResponse
+      let responseBody: string | undefined
+
+      try {
+        response = await this.httpClient.get(url, headers)
+
+        // Read the body inside the same try as the request: a connection
+        // dropped mid-response fails here rather than above, and is just as
+        // worth retrying as one that never delivered a status at all.
+        if (response.message.statusCode === 200) {
+          responseBody = await response.readBody()
+        }
+      } catch (error) {
+        if (
+          this.isRetryableNetworkError(error) &&
+          attempt < ReleaseDownloader.MAX_RETRIES
+        ) {
+          core.warning(
+            `Received transient network error on ${operation}, retrying in ${ReleaseDownloader.RETRY_DELAY_MS / 1000}s...`
+          )
+          await this.delay(ReleaseDownloader.RETRY_DELAY_MS)
+          continue
+        }
+
+        throw error
+      }
+
+      if (responseBody !== undefined) {
+        return JSON.parse(responseBody) as T
+      }
+
+      if (
+        this.isRetryableApiStatusCode(response.message.statusCode) &&
+        attempt < ReleaseDownloader.MAX_RETRIES
+      ) {
+        core.warning(
+          `Received ${response.message.statusCode} on ${operation}, retrying in ${ReleaseDownloader.RETRY_DELAY_MS / 1000}s...`
+        )
+        await this.delay(ReleaseDownloader.RETRY_DELAY_MS)
+        continue
+      }
+
+      throw new HttpError(response.message.statusCode ?? 0, operation, url)
+    }
+
+    throw new ReleaseDownloaderError(
+      `${operation} failed after ${ReleaseDownloader.MAX_RETRIES} attempts`
+    )
+  }
+
+  /**
    * Gets the latest release metadata from github api
    * @param repoPath The source repository path. {owner}/{repo}
    */
@@ -81,30 +179,21 @@ export class ReleaseDownloader {
   ): Promise<GithubRelease> {
     core.info(`Fetching latest release for repo ${repoPath}`)
 
-    const headers: IHeaders = { Accept: 'application/vnd.github.v3+json' }
+    const operation = `Fetch latest release for '${repoPath}'`
 
     const url = !preRelease
       ? `${this.apiRoot}/repos/${repoPath}/releases/latest`
       : `${this.apiRoot}/repos/${repoPath}/releases`
 
-    const response = await this.httpClient.get(url, headers)
-
-    if (response.message.statusCode !== 200) {
-      throw new HttpError(
-        response.message.statusCode ?? 0,
-        `Fetch latest release for '${repoPath}'`,
-        url
-      )
-    }
-
-    const responseBody = await response.readBody()
-
     let release: GithubRelease
     if (!preRelease) {
-      release = JSON.parse(responseBody.toString())
+      release = await this.fetchReleaseMetadata<GithubRelease>(url, operation)
       core.info(`Found latest release version: ${release.tag_name}`)
     } else {
-      const allReleases: GithubRelease[] = JSON.parse(responseBody.toString())
+      const allReleases = await this.fetchReleaseMetadata<GithubRelease[]>(
+        url,
+        operation
+      )
       const latestPreRelease: GithubRelease | undefined = allReleases.find(
         r => r.prerelease === true
       )
@@ -137,21 +226,12 @@ export class ReleaseDownloader {
       throw new ConfigError('Please input a valid tag')
     }
 
-    const headers: IHeaders = { Accept: 'application/vnd.github.v3+json' }
     const url = `${this.apiRoot}/repos/${repoPath}/releases/tags/${tag}`
 
-    const response = await this.httpClient.get(url, headers)
-
-    if (response.message.statusCode !== 200) {
-      throw new HttpError(
-        response.message.statusCode ?? 0,
-        `Fetch release by tag '${tag}' for '${repoPath}'`,
-        url
-      )
-    }
-
-    const responseBody = await response.readBody()
-    const release: GithubRelease = JSON.parse(responseBody.toString())
+    const release = await this.fetchReleaseMetadata<GithubRelease>(
+      url,
+      `Fetch release by tag '${tag}' for '${repoPath}'`
+    )
     core.info(`Found release tag: ${release.tag_name}`)
 
     return release
@@ -172,21 +252,12 @@ export class ReleaseDownloader {
       throw new ConfigError('Please input a valid release ID')
     }
 
-    const headers: IHeaders = { Accept: 'application/vnd.github.v3+json' }
     const url = `${this.apiRoot}/repos/${repoPath}/releases/${id}`
 
-    const response = await this.httpClient.get(url, headers)
-
-    if (response.message.statusCode !== 200) {
-      throw new HttpError(
-        response.message.statusCode ?? 0,
-        `Fetch release by ID '${id}' for '${repoPath}'`,
-        url
-      )
-    }
-
-    const responseBody = await response.readBody()
-    const release: GithubRelease = JSON.parse(responseBody.toString())
+    const release = await this.fetchReleaseMetadata<GithubRelease>(
+      url,
+      `Fetch release by ID '${id}' for '${repoPath}'`
+    )
     core.info(`Found release tag: ${release.tag_name}`)
 
     return release
@@ -303,27 +374,6 @@ export class ReleaseDownloader {
     return result
   }
 
-  private static readonly RETRY_DELAY_MS = 30_000
-  private static readonly MAX_RETRIES = 3
-  private static readonly RETRYABLE_STATUS_CODES = new Set([
-    // 401/403 are included because GitHub redirects asset downloads to signed
-    // S3/blob URLs that intermittently return these mid-run even with a valid
-    // token; retrying recovers from those transient blips.
-    401, 403, 408, 429, 500, 502, 503, 504
-  ])
-  private static readonly RETRYABLE_ERROR_CODES = new Set([
-    'ECONNRESET',
-    'ECONNABORTED',
-    'ETIMEDOUT',
-    'EPIPE',
-    'ENOTFOUND',
-    'EAI_AGAIN',
-    'UND_ERR_SOCKET',
-    'UND_ERR_CONNECT_TIMEOUT',
-    'UND_ERR_HEADERS_TIMEOUT',
-    'UND_ERR_BODY_TIMEOUT'
-  ])
-
   private async downloadFile(
     asset: DownloadMetaData,
     outputPath: string
@@ -364,7 +414,7 @@ export class ReleaseDownloader {
       }
 
       if (
-        this.isRetryableStatusCode(response.message.statusCode) &&
+        this.isRetryableAssetStatusCode(response.message.statusCode) &&
         attempt < ReleaseDownloader.MAX_RETRIES
       ) {
         core.warning(
@@ -390,12 +440,20 @@ export class ReleaseDownloader {
     return new Promise(resolve => setTimeout(resolve, ms))
   }
 
-  private isRetryableStatusCode(statusCode?: number): boolean {
+  private isRetryableAssetStatusCode(statusCode?: number): boolean {
     if (statusCode === undefined) {
       return false
     }
 
-    return ReleaseDownloader.RETRYABLE_STATUS_CODES.has(statusCode)
+    return ReleaseDownloader.RETRYABLE_ASSET_STATUS_CODES.has(statusCode)
+  }
+
+  private isRetryableApiStatusCode(statusCode?: number): boolean {
+    if (statusCode === undefined) {
+      return false
+    }
+
+    return ReleaseDownloader.RETRYABLE_API_STATUS_CODES.has(statusCode)
   }
 
   private isRetryableNetworkError(error: unknown): boolean {

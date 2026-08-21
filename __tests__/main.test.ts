@@ -563,18 +563,129 @@ test('Fail asset download after exhausting retries', async () => {
   delaySpy.mockRestore()
 })
 
+test('Retry release lookup on socket hang up', async () => {
+  nock.cleanAll()
+
+  nock('https://api.github.com')
+    .get('/repos/robinraju/probable-potato/releases/latest')
+    .replyWithError('socket hang up')
+    .get('/repos/robinraju/probable-potato/releases/latest')
+    .reply(200, readFromFile('1-release-latest.json'))
+
+  nock('https://api.github.com', {
+    reqheaders: { accept: 'application/octet-stream' }
+  })
+    .get('/repos/robinraju/probable-potato/releases/assets/66946546')
+    .replyWithFile(200, `${__dirname}/resource/assets/test-1.txt`)
+
+  const delaySpy = jest
+    .spyOn(
+      downloader as unknown as { delay: (ms: number) => Promise<void> },
+      'delay'
+    )
+    .mockResolvedValue(undefined)
+
+  const result = await downloader.download(retrySettings('test-1.txt'))
+  expect(result.length).toBe(1)
+  expect(delaySpy).toHaveBeenCalledTimes(1)
+
+  delaySpy.mockRestore()
+})
+
+test('Retry release lookup on retryable status code', async () => {
+  nock.cleanAll()
+
+  nock('https://api.github.com')
+    .get('/repos/robinraju/probable-potato/releases/latest')
+    .reply(503, 'Service Unavailable')
+    .get('/repos/robinraju/probable-potato/releases/latest')
+    .reply(200, readFromFile('1-release-latest.json'))
+
+  nock('https://api.github.com', {
+    reqheaders: { accept: 'application/octet-stream' }
+  })
+    .get('/repos/robinraju/probable-potato/releases/assets/66946546')
+    .replyWithFile(200, `${__dirname}/resource/assets/test-1.txt`)
+
+  const delaySpy = jest
+    .spyOn(
+      downloader as unknown as { delay: (ms: number) => Promise<void> },
+      'delay'
+    )
+    .mockResolvedValue(undefined)
+
+  const result = await downloader.download(retrySettings('test-1.txt'))
+  expect(result.length).toBe(1)
+  expect(delaySpy).toHaveBeenCalledTimes(1)
+
+  delaySpy.mockRestore()
+})
+
+test('Fail release lookup after exhausting retries', async () => {
+  nock.cleanAll()
+
+  nock('https://api.github.com')
+    .get('/repos/robinraju/probable-potato/releases/latest')
+    .times(3)
+    .replyWithError('socket hang up')
+
+  const delaySpy = jest
+    .spyOn(
+      downloader as unknown as { delay: (ms: number) => Promise<void> },
+      'delay'
+    )
+    .mockResolvedValue(undefined)
+
+  await expect(
+    downloader.download(retrySettings('test-1.txt'))
+  ).rejects.toThrow('socket hang up')
+  expect(delaySpy).toHaveBeenCalledTimes(2)
+
+  delaySpy.mockRestore()
+})
+
+test('Do not retry release lookup on an unauthorized response', async () => {
+  nock.cleanAll()
+
+  nock('https://api.github.com')
+    .get('/repos/robinraju/probable-potato/releases/latest')
+    .reply(401, 'Unauthorized')
+
+  const delaySpy = jest
+    .spyOn(
+      downloader as unknown as { delay: (ms: number) => Promise<void> },
+      'delay'
+    )
+    .mockResolvedValue(undefined)
+
+  await expect(
+    downloader.download(retrySettings('test-1.txt'))
+  ).rejects.toThrow("Fetch latest release for 'robinraju/probable-potato'")
+  expect(delaySpy).not.toHaveBeenCalled()
+
+  delaySpy.mockRestore()
+})
+
 test('Retry helpers classify status codes and network errors', async () => {
   const internal = downloader as unknown as {
-    isRetryableStatusCode: (code?: number) => boolean
+    isRetryableAssetStatusCode: (code?: number) => boolean
+    isRetryableApiStatusCode: (code?: number) => boolean
     isRetryableNetworkError: (err: unknown) => boolean
     delay: (ms: number) => Promise<void>
   }
 
-  expect(internal.isRetryableStatusCode(503)).toBe(true)
-  expect(internal.isRetryableStatusCode(401)).toBe(true)
-  expect(internal.isRetryableStatusCode(403)).toBe(true)
-  expect(internal.isRetryableStatusCode(200)).toBe(false)
-  expect(internal.isRetryableStatusCode(undefined)).toBe(false)
+  expect(internal.isRetryableAssetStatusCode(503)).toBe(true)
+  expect(internal.isRetryableAssetStatusCode(401)).toBe(true)
+  expect(internal.isRetryableAssetStatusCode(403)).toBe(true)
+  expect(internal.isRetryableAssetStatusCode(200)).toBe(false)
+  expect(internal.isRetryableAssetStatusCode(undefined)).toBe(false)
+
+  expect(internal.isRetryableApiStatusCode(503)).toBe(true)
+  expect(internal.isRetryableApiStatusCode(403)).toBe(true)
+  // A 401 from the API is a bad token, not a blip, so it is not retried
+  expect(internal.isRetryableApiStatusCode(401)).toBe(false)
+  expect(internal.isRetryableApiStatusCode(200)).toBe(false)
+  expect(internal.isRetryableApiStatusCode(undefined)).toBe(false)
 
   expect(internal.isRetryableNetworkError({ code: 'ECONNRESET' })).toBe(true)
   expect(internal.isRetryableNetworkError({ message: 'socket hang up' })).toBe(
