@@ -26,18 +26,20 @@ export class ReleaseDownloader {
   private static readonly RETRY_DELAY_MS = 30_000
   private static readonly MAX_RETRIES = 3
 
+  // Client errors worth retrying. Every server error is retried as well - see
+  // isRetryableServerError - so no 5xx code is listed here.
   private static readonly RETRYABLE_ASSET_STATUS_CODES = new Set([
     // 401/403 are included because GitHub redirects asset downloads to signed
     // S3/blob URLs that intermittently return these mid-run even with a valid
     // token; retrying recovers from those transient blips.
-    401, 403, 408, 429, 500, 502, 503, 504
+    401, 403, 408, 429
   ])
 
   private static readonly RETRYABLE_API_STATUS_CODES = new Set([
     // 403 covers secondary rate limits, which clear on their own. 401 is
     // absent: an API call carries our own token with no signed-URL redirect in
     // the way, so a 401 is a bad token and will fail identically every time.
-    403, 408, 429, 500, 502, 503, 504
+    403, 408, 429
   ])
 
   private static readonly RETRYABLE_ERROR_CODES = new Set([
@@ -445,7 +447,10 @@ export class ReleaseDownloader {
       return false
     }
 
-    return ReleaseDownloader.RETRYABLE_ASSET_STATUS_CODES.has(statusCode)
+    return (
+      this.isRetryableServerError(statusCode) ||
+      ReleaseDownloader.RETRYABLE_ASSET_STATUS_CODES.has(statusCode)
+    )
   }
 
   private isRetryableApiStatusCode(statusCode?: number): boolean {
@@ -453,7 +458,21 @@ export class ReleaseDownloader {
       return false
     }
 
-    return ReleaseDownloader.RETRYABLE_API_STATUS_CODES.has(statusCode)
+    return (
+      this.isRetryableServerError(statusCode) ||
+      ReleaseDownloader.RETRYABLE_API_STATUS_CODES.has(statusCode)
+    )
+  }
+
+  /**
+   * Any status from 500 up. The asset download is redirected to blob storage,
+   * which has answered with codes no list anticipated - an HTTP 618 failed a
+   * download outright while the error message, which already treats every
+   * code from 500 up as a server error, called it "likely temporary". Retrying
+   * by range keeps the retry decision and that message in agreement.
+   */
+  private isRetryableServerError(statusCode: number): boolean {
+    return statusCode >= 500
   }
 
   private isRetryableNetworkError(error: unknown): boolean {
