@@ -534,6 +534,39 @@ test('Retry asset download on retryable status code', async () => {
   delaySpy.mockRestore()
 })
 
+// Blob storage behind the asset redirect has answered with a server error no
+// list anticipated - HTTP 618 - which used to fail the download on the first
+// try. nock refuses statuses above 599, so an unlisted 5xx stands in for it
+// here; the 618 itself is covered by the classification test below.
+test('Retry asset download on an unlisted server error', async () => {
+  nock.cleanAll()
+
+  nock('https://api.github.com')
+    .get('/repos/robinraju/probable-potato/releases/latest')
+    .reply(200, readFromFile('1-release-latest.json'))
+
+  nock('https://api.github.com', {
+    reqheaders: { accept: 'application/octet-stream' }
+  })
+    .get('/repos/robinraju/probable-potato/releases/assets/66946546')
+    .reply(520, 'Unknown Error')
+    .get('/repos/robinraju/probable-potato/releases/assets/66946546')
+    .replyWithFile(200, `${__dirname}/resource/assets/test-1.txt`)
+
+  const delaySpy = jest
+    .spyOn(
+      downloader as unknown as { delay: (ms: number) => Promise<void> },
+      'delay'
+    )
+    .mockResolvedValue(undefined)
+
+  const result = await downloader.download(retrySettings('test-1.txt'))
+  expect(result.length).toBe(1)
+  expect(delaySpy).toHaveBeenCalledTimes(1)
+
+  delaySpy.mockRestore()
+})
+
 test('Fail asset download after exhausting retries', async () => {
   nock.cleanAll()
 
@@ -677,6 +710,10 @@ test('Retry helpers classify status codes and network errors', async () => {
   expect(internal.isRetryableAssetStatusCode(503)).toBe(true)
   expect(internal.isRetryableAssetStatusCode(401)).toBe(true)
   expect(internal.isRetryableAssetStatusCode(403)).toBe(true)
+  // Every server error is retried, including codes outside the standard set
+  expect(internal.isRetryableAssetStatusCode(500)).toBe(true)
+  expect(internal.isRetryableAssetStatusCode(618)).toBe(true)
+  expect(internal.isRetryableAssetStatusCode(404)).toBe(false)
   expect(internal.isRetryableAssetStatusCode(200)).toBe(false)
   expect(internal.isRetryableAssetStatusCode(undefined)).toBe(false)
 
@@ -684,6 +721,9 @@ test('Retry helpers classify status codes and network errors', async () => {
   expect(internal.isRetryableApiStatusCode(403)).toBe(true)
   // A 401 from the API is a bad token, not a blip, so it is not retried
   expect(internal.isRetryableApiStatusCode(401)).toBe(false)
+  expect(internal.isRetryableApiStatusCode(505)).toBe(true)
+  expect(internal.isRetryableApiStatusCode(618)).toBe(true)
+  expect(internal.isRetryableApiStatusCode(404)).toBe(false)
   expect(internal.isRetryableApiStatusCode(200)).toBe(false)
   expect(internal.isRetryableApiStatusCode(undefined)).toBe(false)
 
