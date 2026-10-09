@@ -78,6 +78,26 @@ export class FileNotFoundError extends ReleaseDownloaderError {
 }
 
 /**
+ * Error thrown when an asset's body did not arrive in full - the connection
+ * failed mid-transfer, or ended cleanly short of the size GitHub reports for
+ * the asset. Either way the bytes on disk are not the asset, and a fresh
+ * request is likely to succeed.
+ */
+export class IncompleteDownloadError extends ReleaseDownloaderError {
+  constructor(
+    readonly fileName: string,
+    readonly outFilePath: string,
+    reason: string
+  ) {
+    super(`Incomplete download of '${fileName}': ${reason}`, {
+      fileName,
+      outFilePath
+    })
+    this.name = 'IncompleteDownloadError'
+  }
+}
+
+/**
  * Error thrown when a release asset matching the pattern is not found
  */
 export class AssetNotFoundError extends ReleaseDownloaderError {

@@ -1,6 +1,7 @@
 interface GhAsset {
   name: string
   url: string
+  size: number
 }
 
 export interface GithubRelease {
@@ -17,4 +18,9 @@ export interface DownloadMetaData {
   fileName: string
   url: string
   isTarBallOrZipBall: boolean
+  /**
+   * Byte count GitHub reports for the asset. Absent for tarballs and zipballs,
+   * which GitHub generates on request and publishes no size for.
+   */
+  expectedSize?: number
 }

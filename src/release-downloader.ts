@@ -14,7 +14,8 @@ import {
   AssetNotFoundError,
   ConfigError,
   ReleaseDownloaderError,
-  FileNotFoundError
+  FileNotFoundError,
+  IncompleteDownloadError
 } from './errors.js'
 
 export class ReleaseDownloader {
@@ -284,7 +285,8 @@ export class ReleaseDownloader {
           const dData: DownloadMetaData = {
             fileName: asset.name,
             url: asset['url'],
-            isTarBallOrZipBall: false
+            isTarBallOrZipBall: false,
+            expectedSize: asset.size
           }
           downloads.push(dData)
         }
@@ -412,7 +414,27 @@ export class ReleaseDownloader {
       }
 
       if (response.message.statusCode === 200) {
-        return this.saveFile(outputPath, asset.fileName, response)
+        try {
+          return await this.saveFile(
+            outputPath,
+            asset.fileName,
+            response,
+            asset.expectedSize
+          )
+        } catch (error) {
+          if (
+            error instanceof IncompleteDownloadError &&
+            attempt < ReleaseDownloader.MAX_RETRIES
+          ) {
+            core.warning(
+              `${error.message}, retrying in ${ReleaseDownloader.RETRY_DELAY_MS / 1000}s...`
+            )
+            await this.delay(ReleaseDownloader.RETRY_DELAY_MS)
+            continue
+          }
+
+          throw error
+        }
       }
 
       if (
@@ -499,24 +521,40 @@ export class ReleaseDownloader {
     )
   }
 
+  /**
+   * Streams a response body to disk, and checks it arrived whole.
+   *
+   * A 200 only says the body started. A connection that drops partway can
+   * still end the stream cleanly, leaving a truncated file that looks like a
+   * successful download - a cut-off JSON asset then fails whatever parses it,
+   * steps later and on every retry of that step, with nothing pointing back
+   * here. Comparing the bytes written against the size GitHub reports for the
+   * asset catches that at the source, where a fresh request can still fix it.
+   * @param expectedSize Byte count GitHub reports for the asset, when known
+   */
   private async saveFile(
     outputPath: string,
     fileName: string,
-    httpClientResponse: IHttpClientResponse
+    httpClientResponse: IHttpClientResponse,
+    expectedSize?: number
   ): Promise<string> {
     const outFilePath: string = path.resolve(outputPath, fileName)
     const fileStream: fs.WriteStream = fs.createWriteStream(outFilePath)
 
     return new Promise((resolve, reject) => {
       // Handle errors on BOTH streams
-      httpClientResponse.message.on('error', err =>
+      httpClientResponse.message.on('error', err => {
+        // pipe() does not end the destination when the source fails, so close
+        // it here rather than leave the handle open across a retry.
+        fileStream.destroy()
         reject(
-          new ReleaseDownloaderError(
-            `Download stream failed for '${fileName}': ${err.message}`,
-            { fileName, outFilePath }
+          new IncompleteDownloadError(
+            fileName,
+            outFilePath,
+            `download stream failed: ${err.message}`
           )
         )
-      )
+      })
       fileStream.on('error', err =>
         reject(
           new ReleaseDownloaderError(
@@ -541,6 +579,16 @@ export class ReleaseDownloader {
           return
         }
         const stats = fs.statSync(outFilePath)
+        if (expectedSize !== undefined && stats.size !== expectedSize) {
+          reject(
+            new IncompleteDownloadError(
+              fileName,
+              outFilePath,
+              `received ${stats.size} of ${expectedSize} bytes`
+            )
+          )
+          return
+        }
         core.info(`Downloaded ${fileName} (${stats.size} bytes)`)
         resolve(outFilePath)
       })
