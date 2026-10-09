@@ -43,7 +43,8 @@ const createRelease = (
   assets: [
     {
       name: 'test-1.txt',
-      url: 'https://api.github.com/repos/robinraju/probable-potato/releases/assets/1'
+      url: 'https://api.github.com/repos/robinraju/probable-potato/releases/assets/1',
+      size: 15
     }
   ],
   tarball_url:
@@ -153,7 +154,8 @@ describe('ReleaseDownloader error handling', () => {
           assets: [
             {
               name: 'empty.txt',
-              url: 'https://api.github.com/repos/robinraju/empty-assets/releases/assets/1'
+              url: 'https://api.github.com/repos/robinraju/empty-assets/releases/assets/1',
+              size: 0
             }
           ]
         })
@@ -225,8 +227,9 @@ describe('ReleaseDownloader error handling', () => {
     const result = saveFile(outputFilePath, 'broken.txt', response)
 
     await expect(result).rejects.toMatchObject({
-      name: 'ReleaseDownloaderError',
-      message: "Download stream failed for 'broken.txt': socket hang up"
+      name: 'IncompleteDownloadError',
+      message:
+        "Incomplete download of 'broken.txt': download stream failed: socket hang up"
     })
   })
 

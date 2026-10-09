@@ -596,6 +596,72 @@ test('Fail asset download after exhausting retries', async () => {
   delaySpy.mockRestore()
 })
 
+// A dropped connection can end the response stream cleanly, so a short body
+// looks like a finished download unless it is checked against the asset's size.
+test('Retry asset download when the body arrives truncated', async () => {
+  nock.cleanAll()
+
+  nock('https://api.github.com')
+    .get('/repos/robinraju/probable-potato/releases/latest')
+    .reply(200, readFromFile('1-release-latest.json'))
+
+  const fullBody = fs.readFileSync(`${__dirname}/resource/assets/test-1.txt`)
+
+  nock('https://api.github.com', {
+    reqheaders: { accept: 'application/octet-stream' }
+  })
+    .get('/repos/robinraju/probable-potato/releases/assets/66946546')
+    .reply(200, fullBody.subarray(0, 10))
+    .get('/repos/robinraju/probable-potato/releases/assets/66946546')
+    .replyWithFile(200, `${__dirname}/resource/assets/test-1.txt`)
+
+  const delaySpy = jest
+    .spyOn(
+      downloader as unknown as { delay: (ms: number) => Promise<void> },
+      'delay'
+    )
+    .mockResolvedValue(undefined)
+
+  const result = await downloader.download(retrySettings('test-1.txt'))
+  expect(result.length).toBe(1)
+  expect(fs.readFileSync(result[0])).toEqual(fullBody)
+  expect(delaySpy).toHaveBeenCalledTimes(1)
+
+  delaySpy.mockRestore()
+})
+
+test('Fail asset download when every attempt arrives truncated', async () => {
+  nock.cleanAll()
+
+  nock('https://api.github.com')
+    .get('/repos/robinraju/probable-potato/releases/latest')
+    .reply(200, readFromFile('1-release-latest.json'))
+
+  nock('https://api.github.com', {
+    reqheaders: { accept: 'application/octet-stream' }
+  })
+    .get('/repos/robinraju/probable-potato/releases/assets/66946546')
+    .times(3)
+    .reply(200, 'truncated')
+
+  const delaySpy = jest
+    .spyOn(
+      downloader as unknown as { delay: (ms: number) => Promise<void> },
+      'delay'
+    )
+    .mockResolvedValue(undefined)
+
+  await expect(
+    downloader.download(retrySettings('test-1.txt'))
+  ).rejects.toMatchObject({
+    name: 'IncompleteDownloadError',
+    message: "Incomplete download of 'test-1.txt': received 9 of 46 bytes"
+  })
+  expect(delaySpy).toHaveBeenCalledTimes(2)
+
+  delaySpy.mockRestore()
+})
+
 test('Retry release lookup on socket hang up', async () => {
   nock.cleanAll()
 
