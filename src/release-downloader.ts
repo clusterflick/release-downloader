@@ -26,6 +26,12 @@ export class ReleaseDownloader {
   /** Retry policy shared by the release metadata lookups and asset downloads */
   private static readonly RETRY_DELAY_MS = 30_000
   private static readonly MAX_RETRIES = 3
+  /**
+   * Attempts that resumed an asset and got further through it, which do not
+   * count against MAX_RETRIES. Each one leaves the file strictly larger, so
+   * the download ends either way; this only bounds how long it can take.
+   */
+  private static readonly MAX_RESUMES = 10
 
   // Client errors worth retrying. Every server error is retried as well - see
   // isRetryableServerError - so no 5xx code is listed here.
@@ -382,18 +388,63 @@ export class ReleaseDownloader {
     asset: DownloadMetaData,
     outputPath: string
   ): Promise<string> {
-    const headers: IHeaders = {
-      Accept: 'application/octet-stream'
-    }
+    const outFilePath = path.resolve(outputPath, asset.fileName)
 
-    if (asset.isTarBallOrZipBall) {
-      headers['Accept'] = '*/*'
-    }
+    // Bytes of this asset already on disk from an earlier attempt of this
+    // call. Only ever set from a file this call wrote: a file left behind by
+    // another run may be a different release's copy of the asset.
+    let resumeFrom = 0
+    let wroteFile = false
+    let etag: string | undefined
+    let failures = 0
+    let resumes = 0
 
-    for (let attempt = 1; attempt <= ReleaseDownloader.MAX_RETRIES; attempt++) {
-      core.info(
-        `Downloading file: ${asset.fileName} to: ${outputPath} (attempt ${attempt}/${ReleaseDownloader.MAX_RETRIES})`
+    // Every way an attempt can fail ends here. Returns whether to try again.
+    // An attempt that left more of the asset on disk than it started with
+    // does not spend the retry budget: on a link that drops every few
+    // seconds, each attempt gets further, and restarting from zero meant a
+    // large asset never got all the way through.
+    const retryAfter = async (reason: string): Promise<boolean> => {
+      const partialSize = wroteFile
+        ? this.getResumableSize(asset, outFilePath)
+        : 0
+      const progressed = partialSize > resumeFrom
+      resumeFrom = partialSize
+
+      if (progressed && resumes < ReleaseDownloader.MAX_RESUMES) {
+        resumes++
+      } else if (++failures >= ReleaseDownloader.MAX_RETRIES) {
+        return false
+      }
+
+      core.warning(
+        `${reason}, retrying in ${ReleaseDownloader.RETRY_DELAY_MS / 1000}s...`
       )
+      await this.delay(ReleaseDownloader.RETRY_DELAY_MS)
+      return true
+    }
+
+    for (let attempt = 1; ; attempt++) {
+      const headers: IHeaders = {
+        Accept: asset.isTarBallOrZipBall ? '*/*' : 'application/octet-stream'
+      }
+
+      if (resumeFrom > 0) {
+        headers['Range'] = `bytes=${resumeFrom}-`
+        // Without a validator a resume could splice two different files
+        // together if the asset were replaced between attempts. GitHub's blob
+        // storage ignores If-Range, so the ETag is also compared below.
+        if (etag !== undefined) {
+          headers['If-Range'] = etag
+        }
+        core.info(
+          `Resuming download of ${asset.fileName} from byte ${resumeFrom} of ${asset.expectedSize} (attempt ${attempt})`
+        )
+      } else {
+        core.info(
+          `Downloading file: ${asset.fileName} to: ${outputPath} (attempt ${attempt})`
+        )
+      }
 
       let response: IHttpClientResponse
       try {
@@ -401,35 +452,39 @@ export class ReleaseDownloader {
       } catch (error) {
         if (
           this.isRetryableNetworkError(error) &&
-          attempt < ReleaseDownloader.MAX_RETRIES
+          (await retryAfter(
+            `Received transient network error downloading ${asset.fileName}`
+          ))
         ) {
-          core.warning(
-            `Received transient network error downloading ${asset.fileName}, retrying in ${ReleaseDownloader.RETRY_DELAY_MS / 1000}s...`
-          )
-          await this.delay(ReleaseDownloader.RETRY_DELAY_MS)
           continue
         }
 
         throw error
       }
 
-      if (response.message.statusCode === 200) {
+      const statusCode = response.message.statusCode
+      const append =
+        statusCode === 206 &&
+        resumeFrom > 0 &&
+        this.getContentRangeStart(response) === resumeFrom &&
+        (etag === undefined || this.getStrongEtag(response) === etag)
+
+      if (statusCode === 200 || append) {
+        etag = this.getStrongEtag(response) ?? etag
+        wroteFile = true
         try {
           return await this.saveFile(
             outputPath,
             asset.fileName,
             response,
-            asset.expectedSize
+            asset.expectedSize,
+            append
           )
         } catch (error) {
           if (
             error instanceof IncompleteDownloadError &&
-            attempt < ReleaseDownloader.MAX_RETRIES
+            (await retryAfter(error.message))
           ) {
-            core.warning(
-              `${error.message}, retrying in ${ReleaseDownloader.RETRY_DELAY_MS / 1000}s...`
-            )
-            await this.delay(ReleaseDownloader.RETRY_DELAY_MS)
             continue
           }
 
@@ -437,27 +492,69 @@ export class ReleaseDownloader {
         }
       }
 
-      if (
-        this.isRetryableAssetStatusCode(response.message.statusCode) &&
-        attempt < ReleaseDownloader.MAX_RETRIES
+      // The server answered a resume with a range other than the one asked
+      // for, a different version of the asset, or nothing it could serve - the
+      // partial file no longer lines up with it, so start again from the top.
+      if (resumeFrom > 0 && (statusCode === 206 || statusCode === 416)) {
+        response.message.resume()
+        await io.rmRF(outFilePath)
+        resumeFrom = 0
+        etag = undefined
+        if (
+          await retryAfter(
+            `Received ${statusCode} resuming ${asset.fileName}, restarting it from the beginning`
+          )
+        ) {
+          continue
+        }
+      } else if (
+        this.isRetryableAssetStatusCode(statusCode) &&
+        (await retryAfter(
+          `Received ${statusCode} downloading ${asset.fileName}`
+        ))
       ) {
-        core.warning(
-          `Received ${response.message.statusCode} downloading ${asset.fileName}, retrying in ${ReleaseDownloader.RETRY_DELAY_MS / 1000}s...`
-        )
-        await this.delay(ReleaseDownloader.RETRY_DELAY_MS)
         continue
       }
 
       throw new HttpError(
-        response.message.statusCode ?? 0,
+        statusCode ?? 0,
         `Download asset '${asset.fileName}'`,
         asset.url
       )
     }
+  }
 
-    throw new ReleaseDownloaderError(
-      `Failed to download ${asset.fileName} after ${ReleaseDownloader.MAX_RETRIES} attempts`
-    )
+  /**
+   * How much of an asset a failed attempt left on disk that the next attempt
+   * can resume from. Zero when there is nothing to resume: no file, a file
+   * already at or past the asset's size, or an asset GitHub publishes no size
+   * for - tarballs and zipballs are generated per request, so a later request
+   * has no reason to produce the same bytes.
+   */
+  private getResumableSize(
+    asset: DownloadMetaData,
+    outFilePath: string
+  ): number {
+    if (asset.expectedSize === undefined || !fs.existsSync(outFilePath)) {
+      return 0
+    }
+
+    const size = fs.statSync(outFilePath).size
+    return size < asset.expectedSize ? size : 0
+  }
+
+  private getContentRangeStart(
+    response: IHttpClientResponse
+  ): number | undefined {
+    const contentRange = response.message.headers['content-range']
+    const match = /^bytes (\d+)-/.exec(contentRange ?? '')
+    return match ? Number(match[1]) : undefined
+  }
+
+  /** If-Range only accepts a strong validator; a weak one is ignored. */
+  private getStrongEtag(response: IHttpClientResponse): string | undefined {
+    const etag = response.message.headers['etag']
+    return typeof etag === 'string' && !etag.startsWith('W/') ? etag : undefined
   }
 
   private async delay(ms: number): Promise<void> {
@@ -536,24 +633,25 @@ export class ReleaseDownloader {
     outputPath: string,
     fileName: string,
     httpClientResponse: IHttpClientResponse,
-    expectedSize?: number
+    expectedSize?: number,
+    append = false
   ): Promise<string> {
     const outFilePath: string = path.resolve(outputPath, fileName)
-    const fileStream: fs.WriteStream = fs.createWriteStream(outFilePath)
+    const fileStream: fs.WriteStream = fs.createWriteStream(outFilePath, {
+      flags: append ? 'a' : 'w'
+    })
 
     return new Promise((resolve, reject) => {
+      let streamError: Error | undefined
+
       // Handle errors on BOTH streams
       httpClientResponse.message.on('error', err => {
         // pipe() does not end the destination when the source fails, so close
-        // it here rather than leave the handle open across a retry.
+        // it here rather than leave the handle open across a retry. The
+        // rejection waits for 'close': the next attempt resumes from the
+        // file's size, which is only final once buffered writes have landed.
+        streamError = err
         fileStream.destroy()
-        reject(
-          new IncompleteDownloadError(
-            fileName,
-            outFilePath,
-            `download stream failed: ${err.message}`
-          )
-        )
       })
       fileStream.on('error', err =>
         reject(
@@ -567,6 +665,17 @@ export class ReleaseDownloader {
       const outStream = httpClientResponse.message.pipe(fileStream)
 
       outStream.on('close', () => {
+        if (streamError !== undefined) {
+          reject(
+            new IncompleteDownloadError(
+              fileName,
+              outFilePath,
+              `download stream failed: ${streamError.message}`
+            )
+          )
+          return
+        }
+
         // Verify file exists and has content
         if (!fs.existsSync(outFilePath)) {
           reject(

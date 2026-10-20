@@ -1,12 +1,15 @@
 import { jest } from '@jest/globals'
 import * as fs from 'fs'
 import * as path from 'path'
+import { Readable } from 'stream'
 import * as handlers from 'typed-rest-client/Handlers.js'
 import * as io from '@actions/io'
 import * as thc from 'typed-rest-client/HttpClient.js'
+import { IHeaders, IHttpClientResponse } from 'typed-rest-client/Interfaces.js'
 import { fileURLToPath } from 'url'
 
 import { IReleaseDownloadSettings } from '../src/download-settings.js'
+import { DownloadMetaData } from '../src/gh-api.js'
 import { ReleaseDownloader } from '../src/release-downloader.js'
 import nock from 'nock'
 import { extract } from '../src/unarchive.js'
@@ -641,7 +644,7 @@ test('Fail asset download when every attempt arrives truncated', async () => {
     reqheaders: { accept: 'application/octet-stream' }
   })
     .get('/repos/robinraju/probable-potato/releases/assets/66946546')
-    .times(3)
+    .times(4)
     .reply(200, 'truncated')
 
   const delaySpy = jest
@@ -657,7 +660,9 @@ test('Fail asset download when every attempt arrives truncated', async () => {
     name: 'IncompleteDownloadError',
     message: "Incomplete download of 'test-1.txt': received 9 of 46 bytes"
   })
-  expect(delaySpy).toHaveBeenCalledTimes(2)
+  // The first attempt got 9 bytes further than nothing, so it does not spend
+  // the retry budget; the three that resume and get no further do.
+  expect(delaySpy).toHaveBeenCalledTimes(3)
 
   delaySpy.mockRestore()
 })
@@ -891,4 +896,350 @@ test('Stop queuing further assets once a download fails', async () => {
   expect(downloadSpy).toHaveBeenCalledTimes(callsAtFailure)
 
   downloadSpy.mockRestore()
+})
+
+// The real failure is the connection to blob storage dropping a few seconds
+// into a large asset. nock reports an error raised partway through a body as
+// its own unhandled error rather than on the response, so those cases stub
+// the client's get() instead and record the headers each request was sent.
+type StubReply = {
+  status: number
+  body?: Buffer
+  headers?: Record<string, string>
+  aborted?: boolean
+}
+
+const stubAssetRequests = (
+  replies: StubReply[]
+): { requests: IHeaders[]; restore: () => void } => {
+  const requests: IHeaders[] = []
+  const spy = jest
+    .spyOn(httpClent, 'get')
+    .mockImplementation(async (_url, headers) => {
+      requests.push({ ...headers })
+      const reply = replies.shift()
+      if (reply === undefined) {
+        throw new Error('Unexpected request')
+      }
+
+      const message = new Readable({ read() {} })
+      message.push(reply.body ?? Buffer.alloc(0))
+      if (reply.aborted) {
+        // Cut the connection once the bytes before it have reached the disk,
+        // as they will have seconds into a real download. Cutting it sooner
+        // drops them while the file is still opening, leaving nothing to resume.
+        setTimeout(() => message.destroy(new Error('aborted')), 50)
+      } else {
+        message.push(null)
+      }
+      return {
+        message: Object.assign(message, {
+          statusCode: reply.status,
+          headers: reply.headers ?? {}
+        })
+      } as unknown as IHttpClientResponse
+    })
+
+  return { requests, restore: () => spy.mockRestore() }
+}
+
+const contentRange = (start: number, body: Buffer): Record<string, string> => ({
+  'content-range': `bytes ${start}-${body.length - 1}/${body.length}`
+})
+
+const assetPath = '/repos/robinraju/probable-potato/releases/assets/66946546'
+const assetBody = (): Buffer =>
+  fs.readFileSync(`${__dirname}/resource/assets/test-1.txt`)
+const resumableAsset = (): DownloadMetaData => ({
+  fileName: 'test-1.txt',
+  url: `https://api.github.com${assetPath}`,
+  isTarBallOrZipBall: false,
+  expectedSize: assetBody().length
+})
+
+const downloadFile = async (asset: DownloadMetaData): Promise<string> =>
+  (downloader as unknown as DownloadInternals).downloadFile(
+    asset,
+    outputFilePath
+  )
+
+const mockDelay = (): ReturnType<typeof jest.spyOn> =>
+  jest
+    .spyOn(
+      downloader as unknown as { delay: (ms: number) => Promise<void> },
+      'delay'
+    )
+    .mockResolvedValue(undefined)
+
+describe('Resuming a download that was cut off', () => {
+  beforeEach(async () => {
+    nock.cleanAll()
+    await io.rmRF(path.resolve(outputFilePath, 'test-1.txt'))
+    await io.mkdirP(outputFilePath)
+  })
+
+  test('asks for only the missing bytes, guarded by the ETag', async () => {
+    const body = assetBody()
+    const stub = stubAssetRequests([
+      {
+        status: 200,
+        body: body.subarray(0, 10),
+        headers: { etag: '"v1"' },
+        aborted: true
+      },
+      {
+        status: 206,
+        body: body.subarray(10),
+        headers: { ...contentRange(10, body), etag: '"v1"' }
+      }
+    ])
+    const delaySpy = mockDelay()
+
+    try {
+      const result = await downloadFile(resumableAsset())
+      expect(fs.readFileSync(result)).toEqual(body)
+      expect(stub.requests[0]['Range']).toBeUndefined()
+      expect(stub.requests[1]).toMatchObject({
+        Range: 'bytes=10-',
+        'If-Range': '"v1"'
+      })
+      expect(delaySpy).toHaveBeenCalledTimes(1)
+    } finally {
+      stub.restore()
+      delaySpy.mockRestore()
+    }
+  })
+
+  // GitHub's blob storage serves the range whatever If-Range says, so the
+  // ETag is checked here too, or a replaced asset would be spliced onto the old.
+  test('starts over when the asset changed between attempts', async () => {
+    const body = assetBody()
+    const stub = stubAssetRequests([
+      {
+        status: 200,
+        body: body.subarray(0, 10),
+        headers: { etag: '"v1"' },
+        aborted: true
+      },
+      {
+        status: 206,
+        body: body.subarray(10),
+        headers: { ...contentRange(10, body), etag: '"v2"' }
+      },
+      { status: 200, body, headers: { etag: '"v2"' } }
+    ])
+    const delaySpy = mockDelay()
+
+    try {
+      const result = await downloadFile(resumableAsset())
+      expect(fs.readFileSync(result)).toEqual(body)
+      expect(stub.requests[2]['Range']).toBeUndefined()
+      expect(delaySpy).toHaveBeenCalledTimes(2)
+    } finally {
+      stub.restore()
+      delaySpy.mockRestore()
+    }
+  })
+
+  test('sends no If-Range for a weak ETag', async () => {
+    const body = assetBody()
+
+    nock('https://api.github.com')
+      .get(assetPath)
+      .reply(200, body.subarray(0, 10), { ETag: 'W/"v1"' })
+    nock('https://api.github.com', {
+      reqheaders: { range: 'bytes=10-' },
+      badheaders: ['if-range']
+    })
+      .get(assetPath)
+      .reply(206, body.subarray(10), {
+        'Content-Range': `bytes 10-${body.length - 1}/${body.length}`
+      })
+
+    const delaySpy = mockDelay()
+
+    const result = await downloadFile(resumableAsset())
+    expect(fs.readFileSync(result)).toEqual(body)
+
+    delaySpy.mockRestore()
+  })
+
+  test('starts over when the server ignores the range', async () => {
+    const body = assetBody()
+
+    nock('https://api.github.com')
+      .get(assetPath)
+      .reply(200, body.subarray(0, 10))
+      .get(assetPath)
+      .reply(200, body)
+
+    const delaySpy = mockDelay()
+
+    const result = await downloadFile(resumableAsset())
+    expect(fs.readFileSync(result)).toEqual(body)
+
+    delaySpy.mockRestore()
+  })
+
+  test.each([
+    ['cannot serve the range', 416, {}],
+    ['answers with a different range', 206, { 'Content-Range': 'bytes 0-9/46' }]
+  ])(
+    'discards the partial file when the server %s',
+    async (_case, status, headers) => {
+      const body = assetBody()
+
+      nock('https://api.github.com')
+        .get(assetPath)
+        .reply(200, body.subarray(0, 10))
+      nock('https://api.github.com', { reqheaders: { range: 'bytes=10-' } })
+        .get(assetPath)
+        .reply(status, 'nope', headers)
+      nock('https://api.github.com', { badheaders: ['range'] })
+        .get(assetPath)
+        .reply(200, body)
+
+      const delaySpy = mockDelay()
+
+      const result = await downloadFile(resumableAsset())
+      expect(fs.readFileSync(result)).toEqual(body)
+      expect(delaySpy).toHaveBeenCalledTimes(2)
+      expect(nock.isDone()).toBe(true)
+
+      delaySpy.mockRestore()
+    }
+  )
+
+  test('fails when a resume is refused on the last attempt', async () => {
+    const body = assetBody()
+
+    nock('https://api.github.com')
+      .get(assetPath)
+      .reply(200, body.subarray(0, 10))
+      .get(assetPath)
+      .reply(503)
+      .get(assetPath)
+      .reply(503)
+      .get(assetPath)
+      .reply(416)
+
+    const delaySpy = mockDelay()
+
+    await expect(downloadFile(resumableAsset())).rejects.toThrow(
+      "Download asset 'test-1.txt'"
+    )
+
+    delaySpy.mockRestore()
+  })
+
+  // Five drops in a row, each getting further, would have failed outright
+  // when every attempt counted against the three allowed.
+  test('does not spend the retry budget on attempts that got further', async () => {
+    const body = assetBody()
+    const stub = stubAssetRequests([
+      { status: 200, body: body.subarray(0, 5), aborted: true },
+      ...[5, 10, 15, 20].map(start => ({
+        status: 206,
+        body: body.subarray(start, start + 5),
+        headers: contentRange(start, body),
+        aborted: true
+      })),
+      { status: 206, body: body.subarray(25), headers: contentRange(25, body) }
+    ])
+    const delaySpy = mockDelay()
+
+    try {
+      const result = await downloadFile(resumableAsset())
+      expect(fs.readFileSync(result)).toEqual(body)
+      expect(stub.requests.map(headers => headers['Range'])).toEqual([
+        undefined,
+        'bytes=5-',
+        'bytes=10-',
+        'bytes=15-',
+        'bytes=20-',
+        'bytes=25-'
+      ])
+      expect(delaySpy).toHaveBeenCalledTimes(5)
+    } finally {
+      stub.restore()
+      delaySpy.mockRestore()
+    }
+  })
+
+  test('counts progress against the budget once resumes run out', async () => {
+    const limits = ReleaseDownloader as unknown as { MAX_RESUMES: number }
+    const maxResumes = limits.MAX_RESUMES
+    limits.MAX_RESUMES = 1
+
+    const body = assetBody()
+    const stub = stubAssetRequests([
+      { status: 200, body: body.subarray(0, 5), aborted: true },
+      ...[5, 10, 15].map(start => ({
+        status: 206,
+        body: body.subarray(start, start + 5),
+        headers: contentRange(start, body),
+        aborted: true
+      }))
+    ])
+    const delaySpy = mockDelay()
+
+    try {
+      await expect(downloadFile(resumableAsset())).rejects.toMatchObject({
+        name: 'IncompleteDownloadError',
+        message:
+          "Incomplete download of 'test-1.txt': download stream failed: aborted"
+      })
+      expect(stub.requests).toHaveLength(4)
+      expect(delaySpy).toHaveBeenCalledTimes(3)
+    } finally {
+      limits.MAX_RESUMES = maxResumes
+      stub.restore()
+      delaySpy.mockRestore()
+    }
+  })
+
+  test('never resumes from a file it did not write', async () => {
+    const body = assetBody()
+    fs.writeFileSync(
+      path.resolve(outputFilePath, 'test-1.txt'),
+      body.subarray(0, 10)
+    )
+
+    nock('https://api.github.com', { badheaders: ['range'] })
+      .get(assetPath)
+      .reply(503)
+      .get(assetPath)
+      .reply(200, body)
+
+    const delaySpy = mockDelay()
+
+    const result = await downloadFile(resumableAsset())
+    expect(fs.readFileSync(result)).toEqual(body)
+
+    delaySpy.mockRestore()
+  })
+
+  // GitHub generates tarballs and zipballs per request and publishes no size,
+  // so a later request has no reason to produce the same bytes to splice onto.
+  test('restarts a tarball rather than resuming it', async () => {
+    const body = assetBody()
+    const stub = stubAssetRequests([
+      { status: 200, body: body.subarray(0, 10), aborted: true },
+      { status: 200, body }
+    ])
+    const delaySpy = mockDelay()
+
+    try {
+      const result = await downloadFile({
+        ...resumableAsset(),
+        expectedSize: undefined,
+        isTarBallOrZipBall: true
+      })
+      expect(fs.readFileSync(result)).toEqual(body)
+      expect(stub.requests[1]['Range']).toBeUndefined()
+    } finally {
+      stub.restore()
+      delaySpy.mockRestore()
+    }
+  })
 })
