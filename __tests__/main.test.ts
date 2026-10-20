@@ -907,6 +907,8 @@ type StubReply = {
   body?: Buffer
   headers?: Record<string, string>
   aborted?: boolean
+  /** Deliver the body in chunks and cut the connection partway through */
+  abortedMidFlow?: boolean
 }
 
 const stubAssetRequests = (
@@ -923,13 +925,30 @@ const stubAssetRequests = (
       }
 
       const message = new Readable({ read() {} })
-      message.push(reply.body ?? Buffer.alloc(0))
-      if (reply.aborted) {
+      const body = reply.body ?? Buffer.alloc(0)
+      if (reply.abortedMidFlow) {
+        // A real socket keeps handing over data while the disk catches up, so
+        // the cut lands with a write in flight.
+        const chunkSize = 64 * 1024
+        let offset = 0
+        const pump = (): void => {
+          if (offset >= body.length / 2) {
+            message.destroy(new Error('aborted'))
+            return
+          }
+          message.push(body.subarray(offset, offset + chunkSize))
+          offset += chunkSize
+          setImmediate(pump)
+        }
+        setImmediate(pump)
+      } else if (reply.aborted) {
+        message.push(body)
         // Cut the connection once the bytes before it have reached the disk,
         // as they will have seconds into a real download. Cutting it sooner
         // drops them while the file is still opening, leaving nothing to resume.
         setTimeout(() => message.destroy(new Error('aborted')), 50)
       } else {
+        message.push(body)
         message.push(null)
       }
       return {
@@ -1237,6 +1256,32 @@ describe('Resuming a download that was cut off', () => {
       })
       expect(fs.readFileSync(result)).toEqual(body)
       expect(stub.requests[1]['Range']).toBeUndefined()
+    } finally {
+      stub.restore()
+      delaySpy.mockRestore()
+    }
+  })
+
+  // Destroying the file stream while a write is still in flight makes it emit
+  // its own error, which settled the download as a failed write to disk
+  // rather than a cut-off it could resume.
+  test('resumes when the stream fails with writes in flight', async () => {
+    const body = Buffer.alloc(8 * 1024 * 1024, 'x')
+    const stub = stubAssetRequests([
+      { status: 200, body, abortedMidFlow: true },
+      // Where the cut lands depends on the disk, so the resume is answered
+      // with the whole asset, as a server that ignores the range would.
+      { status: 200, body }
+    ])
+    const delaySpy = mockDelay()
+
+    try {
+      const result = await downloadFile({
+        ...resumableAsset(),
+        expectedSize: body.length
+      })
+      expect(fs.statSync(result).size).toBe(body.length)
+      expect(stub.requests[1]['Range']).toMatch(/^bytes=\d+-$/)
     } finally {
       stub.restore()
       delaySpy.mockRestore()
