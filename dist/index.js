@@ -39294,8 +39294,12 @@ class ReleaseDownloader {
                 // it here rather than leave the handle open across a retry. The
                 // rejection waits for 'close': the next attempt resumes from the
                 // file's size, which is only final once buffered writes have landed.
+                // end() rather than destroy(): destroying a file stream with a write
+                // in flight makes it emit its own error, which would settle this as
+                // a failed write to disk instead of a cut-off to resume.
                 streamError = err;
-                fileStream.destroy();
+                httpClientResponse.message.unpipe(fileStream);
+                fileStream.end();
             });
             fileStream.on('error', err => reject(new ReleaseDownloaderError(`Failed to write '${fileName}': ${err.message}`, { fileName, outFilePath })));
             const outStream = httpClientResponse.message.pipe(fileStream);
