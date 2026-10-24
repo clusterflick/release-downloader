@@ -39324,14 +39324,20 @@ class ReleaseDownloader {
         if (statusCode !== 403 && statusCode !== 429) {
             return undefined;
         }
+        // A header can name a time that has already come: GitHub has gone on
+        // refusing past its own x-ratelimit-reset. Taken at its word that is a
+        // wait of nothing, and a request would spend all its waits in a second,
+        // so it falls back to the backoff instead.
+        const backoff = ReleaseDownloader.RATE_LIMIT_BASE_DELAY_MS * 2 ** waitsSoFar;
         const headers = response.message.headers;
         const retryAfter = Number(headers['retry-after']);
         if (headers['retry-after'] !== undefined && Number.isFinite(retryAfter)) {
-            return retryAfter * 1000;
+            return retryAfter > 0 ? retryAfter * 1000 : backoff;
         }
         const reset = Number(headers['x-ratelimit-reset']);
         if (headers['x-ratelimit-remaining'] === '0' && Number.isFinite(reset)) {
-            return Math.max(reset * 1000 - Date.now(), 0);
+            const untilReset = reset * 1000 - Date.now();
+            return untilReset > 0 ? untilReset : backoff;
         }
         if (statusCode === 403) {
             let body = '';
@@ -39345,7 +39351,7 @@ class ReleaseDownloader {
                 return undefined;
             }
         }
-        return ReleaseDownloader.RATE_LIMIT_BASE_DELAY_MS * 2 ** waitsSoFar;
+        return backoff;
     }
     /**
      * Holds every request off until the rate limit has had its wait, and
