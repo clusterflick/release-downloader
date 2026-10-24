@@ -44,6 +44,8 @@ const createRelease = (
     {
       name: 'test-1.txt',
       url: 'https://api.github.com/repos/robinraju/probable-potato/releases/assets/1',
+      browser_download_url:
+        'https://github.com/robinraju/probable-potato/releases/download/1.0.0/test-1.txt',
       size: 15
     }
   ],
@@ -83,6 +85,12 @@ describe('ReleaseDownloader error handling', () => {
 
   afterEach(async () => {
     nock.cleanAll()
+    // Private, so assets come through the API as these tests mock them
+    for (const repo of ['probable-potato', 'empty-assets']) {
+      nock('https://api.github.com')
+        .get(`/repos/robinraju/${repo}`)
+        .reply(200, { private: true })
+    }
     jest.restoreAllMocks()
     await io.rmRF(outputFilePath)
   })
@@ -155,6 +163,8 @@ describe('ReleaseDownloader error handling', () => {
             {
               name: 'empty.txt',
               url: 'https://api.github.com/repos/robinraju/empty-assets/releases/assets/1',
+              browser_download_url:
+                'https://github.com/robinraju/empty-assets/releases/download/1.0.0/empty.txt',
               size: 0
             }
           ]

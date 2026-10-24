@@ -5,7 +5,7 @@ import * as path from 'path'
 import * as thc from 'typed-rest-client/HttpClient.js'
 import { minimatch } from 'minimatch'
 
-import { DownloadMetaData, GithubRelease } from './gh-api.js'
+import { DownloadMetaData, GithubRelease, GithubRepository } from './gh-api.js'
 import { IHeaders, IHttpClientResponse } from 'typed-rest-client/Interfaces.js'
 
 import { IReleaseDownloadSettings } from './download-settings.js'
@@ -68,6 +68,8 @@ export class ReleaseDownloader {
     403, 408, 429
   ])
 
+  private static readonly GITHUB_DOT_COM_API = 'https://api.github.com'
+
   private static readonly RETRYABLE_ERROR_CODES = new Set([
     'ECONNRESET',
     'ECONNABORTED',
@@ -112,9 +114,17 @@ export class ReleaseDownloader {
       )
     }
 
+    const useDownloadUrls =
+      downloadSettings.fileName.length > 0 &&
+      ghRelease.assets.length > 0 &&
+      (await this.isPublicGithubDotComRepository(
+        downloadSettings.sourceRepoPath
+      ))
+
     const resolvedAssets: DownloadMetaData[] = this.resolveAssets(
       ghRelease,
-      downloadSettings
+      downloadSettings,
+      useDownloadUrls
     )
 
     const result = await this.downloadReleaseAssets(
@@ -303,9 +313,46 @@ export class ReleaseDownloader {
     return release
   }
 
+  /**
+   * Whether a release's assets can be fetched from their download URLs on
+   * github.com rather than through the API.
+   *
+   * Through the API every asset is a request against the token's hourly
+   * quota, so a workflow that pulls a release of a few hundred assets spends
+   * that many, and a handful of such workflows sharing one token run it out.
+   * A download URL is not an API request at all, and carries no rate-limit
+   * headers. GitHub only serves it anonymously for a public repository, and
+   * a private one's assets are documented through the API alone, so the
+   * repository is asked rather than assumed. GitHub Enterprise
+   * stays on the API: a "public" repository there can still sit behind a
+   * login that a token does not get past on the web.
+   * @param repoPath The source repository path. {owner}/{repo}
+   */
+  private async isPublicGithubDotComRepository(
+    repoPath: string
+  ): Promise<boolean> {
+    if (this.apiRoot !== ReleaseDownloader.GITHUB_DOT_COM_API) {
+      return false
+    }
+
+    const repository = await this.fetchReleaseMetadata<GithubRepository>(
+      `${this.apiRoot}/repos/${repoPath}`,
+      `Fetch repository '${repoPath}'`
+    )
+    if (repository.private) {
+      return false
+    }
+
+    core.info(
+      `${repoPath} is public, so its assets are downloaded from their download URLs rather than through the API`
+    )
+    return true
+  }
+
   private resolveAssets(
     ghRelease: GithubRelease,
-    downloadSettings: IReleaseDownloadSettings
+    downloadSettings: IReleaseDownloadSettings,
+    useDownloadUrls: boolean
   ): DownloadMetaData[] {
     const downloads: DownloadMetaData[] = []
 
@@ -321,7 +368,7 @@ export class ReleaseDownloader {
 
           const dData: DownloadMetaData = {
             fileName: asset.name,
-            url: asset['url'],
+            url: useDownloadUrls ? asset.browser_download_url : asset.url,
             isTarBallOrZipBall: false,
             expectedSize: asset.size
           }

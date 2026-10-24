@@ -1,7 +1,12 @@
 interface GhAsset {
   name: string
   url: string
+  browser_download_url: string
   size: number
+}
+
+export interface GithubRepository {
+  private: boolean
 }
 
 export interface GithubRelease {

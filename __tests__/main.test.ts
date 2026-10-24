@@ -30,6 +30,7 @@ beforeEach(() => {
   )
   httpClent = new thc.HttpClient('gh-api-client', [credentialHandler])
   downloader = new ReleaseDownloader(httpClent, githubApiUrl)
+  replyWithRepository()
 
   nock('https://api.github.com')
     .get('/repos/robinraju/probable-potato/releases/latest')
@@ -135,6 +136,17 @@ beforeEach(() => {
 afterEach(async () => {
   await io.rmRF(outputFilePath)
 })
+
+// Private, so assets come through the API as these tests mock them. Public
+// repositories are covered in their own tests below.
+function replyWithRepository(
+  isPrivate = true,
+  repoPath = 'robinraju/probable-potato'
+): void {
+  nock('https://api.github.com')
+    .get(`/repos/${repoPath}`)
+    .reply(200, { private: isPrivate })
+}
 
 function readFromFile(fileName: string): string {
   const fileContents = fs.readFileSync(`${__dirname}/resource/${fileName}`, {
@@ -395,6 +407,7 @@ test('Fail when a release with no assets are obtained', async () => {
 }, 10000)
 
 test('Download from latest prerelease', async () => {
+  replyWithRepository(true, 'robinraju/slick-pg')
   const downloadSettings: IReleaseDownloadSettings = {
     sourceRepoPath: 'robinraju/slick-pg',
     isLatest: true,
@@ -453,6 +466,7 @@ test('Download from a release containing only tarBall & zipBall', async () => {
 
 test('Retry asset download on socket hang up', async () => {
   nock.cleanAll()
+  replyWithRepository()
 
   nock('https://api.github.com')
     .get('/repos/robinraju/probable-potato/releases/latest')
@@ -510,6 +524,7 @@ const retrySettings = (fileName: string): IReleaseDownloadSettings => ({
 
 test('Retry asset download on retryable status code', async () => {
   nock.cleanAll()
+  replyWithRepository()
 
   nock('https://api.github.com')
     .get('/repos/robinraju/probable-potato/releases/latest')
@@ -543,6 +558,7 @@ test('Retry asset download on retryable status code', async () => {
 // here; the 618 itself is covered by the classification test below.
 test('Retry asset download on an unlisted server error', async () => {
   nock.cleanAll()
+  replyWithRepository()
 
   nock('https://api.github.com')
     .get('/repos/robinraju/probable-potato/releases/latest')
@@ -572,6 +588,7 @@ test('Retry asset download on an unlisted server error', async () => {
 
 test('Fail asset download after exhausting retries', async () => {
   nock.cleanAll()
+  replyWithRepository()
 
   nock('https://api.github.com')
     .get('/repos/robinraju/probable-potato/releases/latest')
@@ -603,6 +620,7 @@ test('Fail asset download after exhausting retries', async () => {
 // looks like a finished download unless it is checked against the asset's size.
 test('Retry asset download when the body arrives truncated', async () => {
   nock.cleanAll()
+  replyWithRepository()
 
   nock('https://api.github.com')
     .get('/repos/robinraju/probable-potato/releases/latest')
@@ -635,6 +653,7 @@ test('Retry asset download when the body arrives truncated', async () => {
 
 test('Fail asset download when every attempt arrives truncated', async () => {
   nock.cleanAll()
+  replyWithRepository()
 
   nock('https://api.github.com')
     .get('/repos/robinraju/probable-potato/releases/latest')
@@ -669,6 +688,7 @@ test('Fail asset download when every attempt arrives truncated', async () => {
 
 test('Retry release lookup on socket hang up', async () => {
   nock.cleanAll()
+  replyWithRepository()
 
   nock('https://api.github.com')
     .get('/repos/robinraju/probable-potato/releases/latest')
@@ -698,6 +718,7 @@ test('Retry release lookup on socket hang up', async () => {
 
 test('Retry release lookup on retryable status code', async () => {
   nock.cleanAll()
+  replyWithRepository()
 
   nock('https://api.github.com')
     .get('/repos/robinraju/probable-potato/releases/latest')
@@ -727,6 +748,7 @@ test('Retry release lookup on retryable status code', async () => {
 
 test('Fail release lookup after exhausting retries', async () => {
   nock.cleanAll()
+  replyWithRepository()
 
   nock('https://api.github.com')
     .get('/repos/robinraju/probable-potato/releases/latest')
@@ -750,6 +772,7 @@ test('Fail release lookup after exhausting retries', async () => {
 
 test('Do not retry release lookup on an unauthorized response', async () => {
   nock.cleanAll()
+  replyWithRepository()
 
   nock('https://api.github.com')
     .get('/repos/robinraju/probable-potato/releases/latest')
@@ -1303,6 +1326,7 @@ describe('rate limits', () => {
 
   beforeEach(async () => {
     nock.cleanAll()
+    replyWithRepository()
     await io.mkdirP(outputFilePath)
     clock = now
     // A wait moves the clock on by as long as it waited, so a wait that has
@@ -1464,5 +1488,72 @@ describe('rate limits', () => {
     )
 
     expect(delaySpy.mock.calls).toEqual([[45_000], [45_000]])
+  })
+})
+
+describe('public repositories', () => {
+  const settings = (fileName: string): IReleaseDownloadSettings => ({
+    ...retrySettings(fileName),
+    outFilePath: outputFilePath
+  })
+
+  beforeEach(() => {
+    nock.cleanAll()
+    nock('https://api.github.com')
+      .get('/repos/robinraju/probable-potato/releases/latest')
+      .reply(200, readFromFile('1-release-latest.json'))
+  })
+
+  // Every asset fetched through the API is a request against the token's
+  // hourly quota; a download URL is not an API request at all.
+  test('downloads assets from their download URLs', async () => {
+    replyWithRepository(false)
+    // Nothing answers on the API's asset path, so reaching it fails the test
+    nock('https://github.com')
+      .get('/robinraju/probable-potato/releases/download/1.0.1/test-1.txt')
+      .replyWithFile(200, `${__dirname}/resource/assets/test-1.txt`)
+
+    const result = await downloader.download(settings('test-1.txt'))
+    expect(result).toHaveLength(1)
+    expect(fs.readFileSync(result[0], 'utf-8')).toBe(
+      fs.readFileSync(`${__dirname}/resource/assets/test-1.txt`, 'utf-8')
+    )
+    expect(nock.isDone()).toBe(true)
+  })
+
+  test('keeps a private repository on the API', async () => {
+    replyWithRepository(true)
+    nock('https://api.github.com', {
+      reqheaders: { accept: 'application/octet-stream' }
+    })
+      .get('/repos/robinraju/probable-potato/releases/assets/66946546')
+      .replyWithFile(200, `${__dirname}/resource/assets/test-1.txt`)
+
+    const result = await downloader.download(settings('test-1.txt'))
+    expect(result).toHaveLength(1)
+    expect(nock.isDone()).toBe(true)
+  })
+
+  test('fails loudly when the repository cannot be read', async () => {
+    nock('https://api.github.com')
+      .get('/repos/robinraju/probable-potato')
+      .reply(404, 'Not Found')
+
+    await expect(downloader.download(settings('test-1.txt'))).rejects.toThrow(
+      "Fetch repository 'robinraju/probable-potato' failed: Not found - verify the repository/tag/release exists (HTTP 404)"
+    )
+  })
+
+  test('does not ask about the repository when no assets are wanted', async () => {
+    nock('https://api.github.com', { reqheaders: { accept: '*/*' } })
+      .get('/repos/robinraju/probable-potato/tarball/1.0.1')
+      .reply(200, 'tarball')
+
+    const result = await downloader.download({
+      ...settings(''),
+      tarBall: true
+    })
+    expect(result).toHaveLength(1)
+    expect(nock.isDone()).toBe(true)
   })
 })
