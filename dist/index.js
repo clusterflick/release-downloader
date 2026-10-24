@@ -38911,6 +38911,7 @@ class ReleaseDownloader {
         // the way, so a 401 is a bad token and will fail identically every time.
         403, 408, 429
     ]);
+    static GITHUB_DOT_COM_API = 'https://api.github.com';
     static RETRYABLE_ERROR_CODES = new Set([
         'ECONNRESET',
         'ECONNABORTED',
@@ -38941,7 +38942,10 @@ class ReleaseDownloader {
         else {
             throw new ConfigError('Please input a valid tag or release ID, or specify `latest`');
         }
-        const resolvedAssets = this.resolveAssets(ghRelease, downloadSettings);
+        const useDownloadUrls = downloadSettings.fileName.length > 0 &&
+            ghRelease.assets.length > 0 &&
+            (await this.isPublicGithubDotComRepository(downloadSettings.sourceRepoPath));
+        const resolvedAssets = this.resolveAssets(ghRelease, downloadSettings, useDownloadUrls);
         const result = await this.downloadReleaseAssets(resolvedAssets, downloadSettings.outFilePath);
         // Set the output variables for use by other actions
         setOutput('tag_name', ghRelease.tag_name);
@@ -39059,7 +39063,33 @@ class ReleaseDownloader {
         info(`Found release tag: ${release.tag_name}`);
         return release;
     }
-    resolveAssets(ghRelease, downloadSettings) {
+    /**
+     * Whether a release's assets can be fetched from their download URLs on
+     * github.com rather than through the API.
+     *
+     * Through the API every asset is a request against the token's hourly
+     * quota, so a workflow that pulls a release of a few hundred assets spends
+     * that many, and a handful of such workflows sharing one token run it out.
+     * A download URL is not an API request at all, and carries no rate-limit
+     * headers. GitHub only serves it anonymously for a public repository, and
+     * a private one's assets are documented through the API alone, so the
+     * repository is asked rather than assumed. GitHub Enterprise
+     * stays on the API: a "public" repository there can still sit behind a
+     * login that a token does not get past on the web.
+     * @param repoPath The source repository path. {owner}/{repo}
+     */
+    async isPublicGithubDotComRepository(repoPath) {
+        if (this.apiRoot !== ReleaseDownloader.GITHUB_DOT_COM_API) {
+            return false;
+        }
+        const repository = await this.fetchReleaseMetadata(`${this.apiRoot}/repos/${repoPath}`, `Fetch repository '${repoPath}'`);
+        if (repository.private) {
+            return false;
+        }
+        info(`${repoPath} is public, so its assets are downloaded from their download URLs rather than through the API`);
+        return true;
+    }
+    resolveAssets(ghRelease, downloadSettings, useDownloadUrls) {
         const downloads = [];
         if (downloadSettings.fileName.length > 0) {
             if (ghRelease && ghRelease.assets.length > 0) {
@@ -39071,7 +39101,7 @@ class ReleaseDownloader {
                     }
                     const dData = {
                         fileName: asset.name,
-                        url: asset['url'],
+                        url: useDownloadUrls ? asset.browser_download_url : asset.url,
                         isTarBallOrZipBall: false,
                         expectedSize: asset.size
                     };
@@ -39103,8 +39133,11 @@ class ReleaseDownloader {
         }
         return downloads;
     }
-    /** Max concurrent download requests to avoid GitHub rate limiting (403) */
-    static DOWNLOAD_CONCURRENCY = 30;
+    /**
+     * Max concurrent download requests. At 30, a release of a few hundred small
+     * assets met transient network errors on about one download in five.
+     */
+    static DOWNLOAD_CONCURRENCY = 10;
     /**
      * Downloads the specified assets from a given URL, capping the number of
      * requests in flight to avoid triggering GitHub rate limits when many assets
