@@ -1401,6 +1401,42 @@ describe('rate limits', () => {
     expect(delaySpy.mock.calls).toEqual([[90_000]])
   })
 
+  // GitHub went on refusing past its own reset, which read as a wait of 0s
+  // and would have spent every wait in a second.
+  test('backs off when the reset it names has already passed', async () => {
+    const reset = String(now / 1000 + 624)
+    replyWithRelease()
+    assetScope()
+      .get(assetPath)
+      .reply(403, '{"message":"API rate limit exceeded"}', {
+        'x-ratelimit-remaining': '0',
+        'x-ratelimit-reset': reset
+      })
+      .get(assetPath)
+      .times(2)
+      .reply(403, '{"message":"API rate limit exceeded"}', {
+        'x-ratelimit-remaining': '0',
+        'x-ratelimit-reset': reset
+      })
+      .get(assetPath)
+      .replyWithFile(200, `${__dirname}/resource/assets/test-1.txt`)
+
+    await downloader.download(retrySettings('test-1.txt'))
+    expect(delaySpy.mock.calls).toEqual([[624_000], [120_000], [240_000]])
+  })
+
+  test('backs off when retry-after is zero', async () => {
+    replyWithRelease()
+    assetScope()
+      .get(assetPath)
+      .reply(429, '', { 'retry-after': '0' })
+      .get(assetPath)
+      .replyWithFile(200, `${__dirname}/resource/assets/test-1.txt`)
+
+    await downloader.download(retrySettings('test-1.txt'))
+    expect(delaySpy.mock.calls).toEqual([[60_000]])
+  })
+
   // Blob storage behind the asset redirect answers 403 for its own reasons
   test('keeps the plain retry for a 403 that is not a rate limit', async () => {
     replyWithRelease()
