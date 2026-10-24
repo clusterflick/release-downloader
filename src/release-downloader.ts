@@ -407,8 +407,11 @@ export class ReleaseDownloader {
     return downloads
   }
 
-  /** Max concurrent download requests to avoid GitHub rate limiting (403) */
-  private static readonly DOWNLOAD_CONCURRENCY = 30
+  /**
+   * Max concurrent download requests. At 30, a release of a few hundred small
+   * assets met transient network errors on about one download in five.
+   */
+  private static readonly DOWNLOAD_CONCURRENCY = 10
 
   /**
    * Downloads the specified assets from a given URL, capping the number of

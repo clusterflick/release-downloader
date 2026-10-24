@@ -877,11 +877,11 @@ test('Refill download slots without waiting on the slowest asset', async () => {
   const pending = internal.downloadReleaseAssets(assets, outputFilePath)
   await new Promise(resolve => setTimeout(resolve, 50))
 
-  // Downloading in fixed batches of 30 could not have reached asset 30 yet,
+  // Downloading in fixed batches of 10 could not have reached asset 10 yet,
   // because asset 0 is still holding the first batch open.
-  expect(started.has('asset-30.txt')).toBe(true)
+  expect(started.has('asset-10.txt')).toBe(true)
   expect(started.size).toBe(assets.length)
-  expect(maxInFlight).toBeLessThanOrEqual(30)
+  expect(maxInFlight).toBeLessThanOrEqual(10)
 
   releaseSlowAsset()
 
