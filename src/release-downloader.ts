@@ -15,7 +15,8 @@ import {
   ConfigError,
   ReleaseDownloaderError,
   FileNotFoundError,
-  IncompleteDownloadError
+  IncompleteDownloadError,
+  RateLimitError
 } from './errors.js'
 
 export class ReleaseDownloader {
@@ -33,6 +34,22 @@ export class ReleaseDownloader {
    */
   private static readonly MAX_RESUMES = 10
 
+  /**
+   * Rate-limit waits for one request, which do not count against MAX_RETRIES
+   * either: three tries 30s apart is over in a minute, and GitHub's secondary
+   * limits outlast that. Without a header saying how long to wait, the first
+   * wait is a minute and each one after doubles it, as GitHub asks.
+   */
+  private static readonly MAX_RATE_LIMIT_WAITS = 5
+  private static readonly RATE_LIMIT_BASE_DELAY_MS = 60_000
+
+  /**
+   * Until when every request holds off, because one of them was rate limited.
+   * The limit is per user, not per request, so the other download workers
+   * carrying on would only extend it.
+   */
+  private rateLimitedUntil = 0
+
   // Client errors worth retrying. Every server error is retried as well - see
   // isRetryableServerError - so no 5xx code is listed here.
   private static readonly RETRYABLE_ASSET_STATUS_CODES = new Set([
@@ -43,7 +60,9 @@ export class ReleaseDownloader {
   ])
 
   private static readonly RETRYABLE_API_STATUS_CODES = new Set([
-    // 403 covers secondary rate limits, which clear on their own. 401 is
+    // A rate-limited 403 or 429 never reaches this list - backOffIfRateLimited
+    // waits those out first - so these cover the ones GitHub sends without
+    // saying it is rate limiting. 401 is
     // absent: an API call carries our own token with no signed-URL redirect in
     // the way, so a 401 is a bad token and will fail identically every time.
     403, 408, 429
@@ -126,10 +145,14 @@ export class ReleaseDownloader {
     operation: string
   ): Promise<T> {
     const headers: IHeaders = { Accept: 'application/vnd.github.v3+json' }
+    let failures = 0
+    let rateLimitWaits = 0
 
-    for (let attempt = 1; attempt <= ReleaseDownloader.MAX_RETRIES; attempt++) {
+    for (;;) {
       let response: IHttpClientResponse
       let responseBody: string | undefined
+
+      await this.waitOutRateLimit()
 
       try {
         response = await this.httpClient.get(url, headers)
@@ -143,7 +166,7 @@ export class ReleaseDownloader {
       } catch (error) {
         if (
           this.isRetryableNetworkError(error) &&
-          attempt < ReleaseDownloader.MAX_RETRIES
+          ++failures < ReleaseDownloader.MAX_RETRIES
         ) {
           core.warning(
             `Received transient network error on ${operation}, retrying in ${ReleaseDownloader.RETRY_DELAY_MS / 1000}s...`
@@ -160,8 +183,20 @@ export class ReleaseDownloader {
       }
 
       if (
+        await this.backOffIfRateLimited(
+          response,
+          rateLimitWaits,
+          operation,
+          url
+        )
+      ) {
+        rateLimitWaits++
+        continue
+      }
+
+      if (
         this.isRetryableApiStatusCode(response.message.statusCode) &&
-        attempt < ReleaseDownloader.MAX_RETRIES
+        ++failures < ReleaseDownloader.MAX_RETRIES
       ) {
         core.warning(
           `Received ${response.message.statusCode} on ${operation}, retrying in ${ReleaseDownloader.RETRY_DELAY_MS / 1000}s...`
@@ -172,10 +207,6 @@ export class ReleaseDownloader {
 
       throw new HttpError(response.message.statusCode ?? 0, operation, url)
     }
-
-    throw new ReleaseDownloaderError(
-      `${operation} failed after ${ReleaseDownloader.MAX_RETRIES} attempts`
-    )
   }
 
   /**
@@ -398,6 +429,7 @@ export class ReleaseDownloader {
     let etag: string | undefined
     let failures = 0
     let resumes = 0
+    let rateLimitWaits = 0
 
     // Every way an attempt can fail ends here. Returns whether to try again.
     // An attempt that left more of the asset on disk than it started with
@@ -446,6 +478,8 @@ export class ReleaseDownloader {
         )
       }
 
+      await this.waitOutRateLimit()
+
       let response: IHttpClientResponse
       try {
         response = await this.httpClient.get(asset.url, headers)
@@ -490,6 +524,20 @@ export class ReleaseDownloader {
 
           throw error
         }
+      }
+
+      // Ahead of the resume handling: a rate-limited resume leaves the partial
+      // file as it was, and asking for the same range again is still right.
+      if (
+        await this.backOffIfRateLimited(
+          response,
+          rateLimitWaits,
+          `Download asset '${asset.fileName}'`,
+          asset.url
+        )
+      ) {
+        rateLimitWaits++
+        continue
       }
 
       // The server answered a resume with a range other than the one asked
@@ -555,6 +603,87 @@ export class ReleaseDownloader {
   private getStrongEtag(response: IHttpClientResponse): string | undefined {
     const etag = response.message.headers['etag']
     return typeof etag === 'string' && !etag.startsWith('W/') ? etag : undefined
+  }
+
+  /**
+   * Whether a response is GitHub rate limiting us and, if so, how long to
+   * wait: what its headers say when they say it, otherwise a minute doubled
+   * for each wait already spent on this request. Undefined when it is not a
+   * rate limit.
+   *
+   * A 403 is only a rate limit when GitHub says so. Blob storage behind the
+   * asset redirect answers 403 for its own reasons, and those keep the plain
+   * retry they had. With no rate-limit headers, the secondary limit is told
+   * apart by the message in its body.
+   */
+  private async getRateLimitWait(
+    response: IHttpClientResponse,
+    waitsSoFar: number
+  ): Promise<number | undefined> {
+    const statusCode = response.message.statusCode
+    if (statusCode !== 403 && statusCode !== 429) {
+      return undefined
+    }
+
+    const headers = response.message.headers
+    const retryAfter = Number(headers['retry-after'])
+    if (headers['retry-after'] !== undefined && Number.isFinite(retryAfter)) {
+      return retryAfter * 1000
+    }
+
+    const reset = Number(headers['x-ratelimit-reset'])
+    if (headers['x-ratelimit-remaining'] === '0' && Number.isFinite(reset)) {
+      return Math.max(reset * 1000 - Date.now(), 0)
+    }
+
+    if (statusCode === 403) {
+      let body = ''
+      try {
+        body = await response.readBody()
+      } catch {
+        // A body that cannot be read says nothing either way
+      }
+      if (!/rate limit/i.test(body)) {
+        return undefined
+      }
+    }
+
+    return ReleaseDownloader.RATE_LIMIT_BASE_DELAY_MS * 2 ** waitsSoFar
+  }
+
+  /**
+   * Holds every request off until the rate limit has had its wait, and
+   * returns true, when a response was rate limited. Returns false for any
+   * other response, and throws once a request has used up its waits.
+   */
+  private async backOffIfRateLimited(
+    response: IHttpClientResponse,
+    waitsSoFar: number,
+    operation: string,
+    url: string
+  ): Promise<boolean> {
+    const wait = await this.getRateLimitWait(response, waitsSoFar)
+    if (wait === undefined) {
+      return false
+    }
+
+    const statusCode = response.message.statusCode ?? 0
+    if (waitsSoFar >= ReleaseDownloader.MAX_RATE_LIMIT_WAITS) {
+      throw new RateLimitError(statusCode, operation, url, waitsSoFar)
+    }
+
+    this.rateLimitedUntil = Math.max(this.rateLimitedUntil, Date.now() + wait)
+    core.warning(
+      `Rate limited by GitHub (HTTP ${statusCode}) on ${operation}, holding all requests for ${Math.ceil(wait / 1000)}s...`
+    )
+    return true
+  }
+
+  private async waitOutRateLimit(): Promise<void> {
+    const remaining = this.rateLimitedUntil - Date.now()
+    if (remaining > 0) {
+      await this.delay(remaining)
+    }
   }
 
   private async delay(ms: number): Promise<void> {

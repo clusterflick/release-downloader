@@ -98,6 +98,26 @@ export class IncompleteDownloadError extends ReleaseDownloaderError {
 }
 
 /**
+ * Error thrown when GitHub was still rate limiting a request after every wait
+ * it was given. Kept apart from HttpError because a rate-limited 403 is not a
+ * permissions problem, and HttpError's reason for a 403 would say it was.
+ */
+export class RateLimitError extends ReleaseDownloaderError {
+  constructor(
+    readonly statusCode: number,
+    readonly operation: string,
+    readonly url: string,
+    waits: number
+  ) {
+    super(
+      `${operation} failed: still rate limited by GitHub after ${waits} waits (HTTP ${statusCode})`,
+      { url }
+    )
+    this.name = 'RateLimitError'
+  }
+}
+
+/**
  * Error thrown when a release asset matching the pattern is not found
  */
 export class AssetNotFoundError extends ReleaseDownloaderError {

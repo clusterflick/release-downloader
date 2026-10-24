@@ -1288,3 +1288,181 @@ describe('Resuming a download that was cut off', () => {
     }
   })
 })
+
+describe('rate limits', () => {
+  const latestPath = '/repos/robinraju/probable-potato/releases/latest'
+  const secondaryLimitBody = JSON.stringify({
+    message:
+      'You have exceeded a secondary rate limit. Please wait a few minutes before you try again.'
+  })
+  const now = 1_800_000_000_000
+  let clock = now
+
+  let delaySpy: ReturnType<typeof jest.spyOn>
+  let nowSpy: ReturnType<typeof jest.spyOn>
+
+  beforeEach(async () => {
+    nock.cleanAll()
+    await io.mkdirP(outputFilePath)
+    clock = now
+    // A wait moves the clock on by as long as it waited, so a wait that has
+    // been served is over for every request after it.
+    delaySpy = jest
+      .spyOn(
+        downloader as unknown as { delay: (ms: number) => Promise<void> },
+        'delay'
+      )
+      .mockImplementation(async (ms: number) => {
+        clock += ms
+      })
+    nowSpy = jest.spyOn(Date, 'now').mockImplementation(() => clock)
+  })
+
+  afterEach(() => {
+    delaySpy.mockRestore()
+    nowSpy.mockRestore()
+  })
+
+  const replyWithRelease = (): void => {
+    nock('https://api.github.com')
+      .get(latestPath)
+      .reply(200, readFromFile('1-release-latest.json'))
+  }
+
+  const assetScope = (): nock.Scope =>
+    nock('https://api.github.com', {
+      reqheaders: { accept: 'application/octet-stream' }
+    })
+
+  // Three tries 30s apart were all a secondary limit got before, and it
+  // outlasted them, failing the download as a permissions error.
+  test('waits out a secondary rate limit beyond the retry budget', async () => {
+    replyWithRelease()
+    assetScope()
+      .get(assetPath)
+      .times(3)
+      .reply(403, secondaryLimitBody)
+      .get(assetPath)
+      .replyWithFile(200, `${__dirname}/resource/assets/test-1.txt`)
+
+    const result = await downloader.download(retrySettings('test-1.txt'))
+    expect(result).toHaveLength(1)
+    expect(delaySpy.mock.calls).toEqual([[60_000], [120_000], [240_000]])
+  })
+
+  test('waits as long as retry-after says', async () => {
+    replyWithRelease()
+    assetScope()
+      .get(assetPath)
+      .reply(429, '', { 'retry-after': '7' })
+      .get(assetPath)
+      .replyWithFile(200, `${__dirname}/resource/assets/test-1.txt`)
+
+    await downloader.download(retrySettings('test-1.txt'))
+    expect(delaySpy.mock.calls).toEqual([[7_000]])
+  })
+
+  test('waits until the primary limit resets', async () => {
+    replyWithRelease()
+    assetScope()
+      .get(assetPath)
+      .reply(403, '{"message":"API rate limit exceeded"}', {
+        'x-ratelimit-remaining': '0',
+        'x-ratelimit-reset': String(now / 1000 + 90)
+      })
+      .get(assetPath)
+      .replyWithFile(200, `${__dirname}/resource/assets/test-1.txt`)
+
+    await downloader.download(retrySettings('test-1.txt'))
+    expect(delaySpy.mock.calls).toEqual([[90_000]])
+  })
+
+  // Blob storage behind the asset redirect answers 403 for its own reasons
+  test('keeps the plain retry for a 403 that is not a rate limit', async () => {
+    replyWithRelease()
+    assetScope()
+      .get(assetPath)
+      .times(3)
+      .reply(403, '<Error><Code>AuthenticationFailed</Code></Error>')
+
+    await expect(
+      downloader.download(retrySettings('test-1.txt'))
+    ).rejects.toThrow(
+      "Download asset 'test-1.txt' failed: Access denied - check your token has the required permissions (HTTP 403)"
+    )
+    expect(delaySpy.mock.calls).toEqual([[30_000], [30_000]])
+  })
+
+  test('fails as rate limited once the waits are used up', async () => {
+    replyWithRelease()
+    assetScope().get(assetPath).times(6).reply(403, secondaryLimitBody)
+
+    await expect(
+      downloader.download(retrySettings('test-1.txt'))
+    ).rejects.toMatchObject({
+      name: 'RateLimitError',
+      message:
+        "Download asset 'test-1.txt' failed: still rate limited by GitHub after 5 waits (HTTP 403)"
+    })
+    expect(delaySpy.mock.calls).toEqual([
+      [60_000],
+      [120_000],
+      [240_000],
+      [480_000],
+      [960_000]
+    ])
+  })
+
+  test('waits out a rate limit on the release lookup', async () => {
+    nock('https://api.github.com')
+      .get(latestPath)
+      .times(3)
+      .reply(403, secondaryLimitBody)
+      .get(latestPath)
+      .reply(200, readFromFile('1-release-latest.json'))
+    assetScope()
+      .get(assetPath)
+      .replyWithFile(200, `${__dirname}/resource/assets/test-1.txt`)
+
+    const result = await downloader.download(retrySettings('test-1.txt'))
+    expect(result).toHaveLength(1)
+    expect(delaySpy.mock.calls).toEqual([[60_000], [120_000], [240_000]])
+  })
+
+  // The limit is per user, so a worker that was never limited itself still
+  // holds off rather than spend requests extending it.
+  test('holds every request off while any one is rate limited', async () => {
+    const internal = downloader as unknown as {
+      downloadFile: (asset: DownloadMetaData, out: string) => Promise<string>
+    }
+    // Waits leave the clock where it was, so the second download starts as a
+    // concurrent worker would - while the first one's limit is still running.
+    delaySpy.mockResolvedValue(undefined)
+    nock('https://api.github.com')
+      .get('/assets/limited')
+      .reply(429, '', { 'retry-after': '45' })
+      .get('/assets/limited')
+      .reply(200, 'limited')
+      .get('/assets/other')
+      .reply(200, 'other')
+
+    await internal.downloadFile(
+      {
+        fileName: 'limited.txt',
+        url: 'https://api.github.com/assets/limited',
+        isTarBallOrZipBall: false
+      },
+      outputFilePath
+    )
+    await internal.downloadFile(
+      {
+        fileName: 'other.txt',
+        url: 'https://api.github.com/assets/other',
+        isTarBallOrZipBall: false
+      },
+      outputFilePath
+    )
+
+    expect(delaySpy.mock.calls).toEqual([[45_000], [45_000]])
+  })
+})
