@@ -1,5 +1,12 @@
 # Github Release Downloader
 
+> **[Clusterflick](https://clusterflick.com)** is a free, open-source site
+> listing every film showing in London, from 450+ venues in one search. This is
+> its fork of
+> [robinraju/release-downloader](https://github.com/robinraju/release-downloader),
+> used throughout the [Clusterflick](https://github.com/clusterflick) data
+> pipeline.
+
 [![Build and Test](https://github.com/robinraju/release-downloader/actions/workflows/ci.yml/badge.svg)](https://github.com/robinraju/release-downloader/actions/workflows/ci.yml)
 
 A Github Action to download assets from Github release. It can download
